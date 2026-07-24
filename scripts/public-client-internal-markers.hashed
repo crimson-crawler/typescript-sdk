@@ -1,0 +1,10 @@
+# Salted-hash internal marker policy for public client artifact verification.
+# Record format: <salt_hex>:<marker_byte_length>:<sha256_hex of salt || lowercased marker>.
+# Verification hashes sliding windows of lowercased content, keeping scans case-insensitive.
+# Regenerate with scripts/generate-public-marker-policy.py whenever the marker list changes.
+35f3bb7bd872937eeb4d8b51683ac03e:22:8eea2f4afd76a3c6357b713f976b35de3eb21275605e26833090a5f2af631f82
+84a172d8614d7649606cdbbf53a9a73c:12:99aae5d34e13786bbe27629298c85b1083c93df19be5dd5378b9a9f6b486a07b
+3d88d2e1172de8ced734e0029c61394a:12:3296a5568434ab8167aa415fad077ad078b057cbe8988ed96a1e26fbff87abda
+275d66b0f5ba731f1acbc5ece57c9d74:31:3107e86dbc9f0ac00bc79646e25ed3a6676edc2ce2fb25fc2b541bf5bc8de3b1
+78bb2ad0b4299c5733a1759858d8079d:13:a8062487f9b8ef4289f8e04b038fcf991a47eeabe4d076c263315ea4c8861842
+356cb16d9a96d1a52256c0f86c3214b5:20:3961d792265b97d6d1f0fb6c1fae1a26d52a6a833441e3a2c92b3f1545368fbe
