@@ -1,0 +1,94 @@
+{
+  "name": "@crimson-crawler/crimson-crawler-client",
+  "version": "4.1.0",
+  "description": "Typed TypeScript client for the Crimson Crawler API",
+  "license": "Apache-2.0",
+  "author": "Def-Logix, Inc.",
+  "private": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crimson-crawler/typescript-sdk.git"
+  },
+  "homepage": "https://crimsoncrawler.com/docs/clients/typescript-client/",
+  "bugs": {
+    "url": "https://github.com/crimson-crawler/typescript-sdk/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+      "require": { "types": "./dist/index.d.cts", "default": "./dist/index.cjs" }
+    },
+    "./presets": {
+      "import": { "types": "./dist/presets.d.ts", "default": "./dist/presets.js" },
+      "require": { "types": "./dist/presets.d.cts", "default": "./dist/presets.cjs" }
+    },
+    "./_generated": {
+      "import": { "types": "./dist/_generated/index.d.ts", "default": "./dist/_generated/index.js" },
+      "require": { "types": "./dist/_generated/index.d.cts", "default": "./dist/_generated/index.cjs" }
+    },
+    "./_generated/sdk.gen": {
+      "import": { "types": "./dist/_generated/sdk.gen.d.ts", "default": "./dist/_generated/sdk.gen.js" },
+      "require": { "types": "./dist/_generated/sdk.gen.d.cts", "default": "./dist/_generated/sdk.gen.cjs" }
+    },
+    "./_generated/types.gen": {
+      "import": { "types": "./dist/_generated/types.gen.d.ts", "default": "./dist/_generated/types.gen.js" },
+      "require": { "types": "./dist/_generated/types.gen.d.cts", "default": "./dist/_generated/types.gen.cjs" }
+    },
+    "./_generated/client.gen": {
+      "import": { "types": "./dist/_generated/client.gen.d.ts", "default": "./dist/_generated/client.gen.js" },
+      "require": { "types": "./dist/_generated/client.gen.d.cts", "default": "./dist/_generated/client.gen.cjs" }
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "package.json"
+  ],
+  "scripts": {
+    "codegen": "node scripts/codegen.mjs",
+    "build": "tsup && node scripts/verify-exports.mjs --record",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write \"src/**/*.ts\" \"!src/_generated/**\" \"tests/**/*.ts\" \"*.config.ts\" \"eslint.config.js\" \"!dist/**\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"!src/_generated/**\" \"tests/**/*.ts\" \"*.config.ts\" \"eslint.config.js\" \"!dist/**\"",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "prepack": "node scripts/verify-exports.mjs && node scripts/readme-for-pack.mjs --apply",
+    "postpack": "node scripts/readme-for-pack.mjs --restore"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@hey-api/openapi-ts": "^0.99.0",
+    "@types/node": "^22.19.0",
+    "@vitest/coverage-v8": "^4.1.10",
+    "eslint": "^10.3.0",
+    "globals": "^17.6.0",
+    "prettier": "^3.6.2",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.59.2",
+    "vitest": "^4.1.10"
+  },
+  "prettier": {
+    "tabWidth": 2
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dependencies": {
+    "undici": "^7.28.0"
+  },
+  "overrides": {
+    "esbuild": "0.28.1",
+    "js-yaml": "4.3.0"
+  }
+}
