@@ -1,0 +1,10 @@
+.env
+.npmrc
+node_modules/
+dist/
+.vitest/
+coverage/
+src/_generated/
+.readme-brand.bak
+SBOM.cdx.json
+SHA256SUMS
