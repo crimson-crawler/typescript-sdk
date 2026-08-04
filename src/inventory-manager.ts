@@ -12,7 +12,7 @@
  * your key to `/v1/inventory-enrich`. Exposed as `client.inventoryManager` (mirrors the Python `InventoryManagerAPI`).
  */
 
-import { ProgressCallback, pollUntilDone } from "./_poll";
+import { ProgressCallback, pollUntilDone, validatePollOptions } from "./_poll";
 import { UnexpectedStatus } from "./exceptions";
 import { ingestScan as runIngestScan } from "./ingest";
 import { pathSegment } from "./url";
@@ -58,6 +58,12 @@ export interface InventoryOptions {
   linkedArtifactIds?: string[];
 }
 
+/** An attachment requested for enrichment but omitted from its evidence context. */
+export interface AttachmentOmission {
+  attachment_id: string;
+  reason: string;
+}
+
 /** Build the create/update-inventory body — inventory_name required; other fields ride only when provided. */
 function inventoryBody(
   inventoryName: string,
@@ -96,12 +102,16 @@ export class InventoryManagerApi {
   private async request(
     method: string,
     path: string,
-    opts: { params?: Record<string, string>; json?: unknown } = {},
+    opts: {
+      params?: Record<string, string>;
+      json?: unknown;
+      timeoutMs?: number;
+    } = {},
   ): Promise<Response> {
     const url = new URL(`${this.baseUrl}${path}`);
     for (const [k, v] of Object.entries(opts.params ?? {}))
       url.searchParams.set(k, v);
-    const resp = await this.doFetch(url, {
+    const init: RequestInit = {
       method,
       headers: {
         apikey: this.#apiKey,
@@ -110,7 +120,18 @@ export class InventoryManagerApi {
           : {}),
       },
       ...(opts.json !== undefined ? { body: JSON.stringify(opts.json) } : {}),
-    });
+    };
+    const resp =
+      opts.timeoutMs === undefined
+        ? await this.doFetch(url, init)
+        : await this.doFetch(
+            new Request(url, {
+              ...init,
+              signal: AbortSignal.timeout(
+                Math.max(1, Math.ceil(opts.timeoutMs)),
+              ),
+            }),
+          );
     if (!resp.ok) {
       const body = await resp.text().catch(() => "");
       throw new UnexpectedStatus(
@@ -145,10 +166,10 @@ export class InventoryManagerApi {
   }
 
   /**
-   * An inventory as a **one-shot, LLM-ready context window** — a single bounded text bundle
-   * (inventory + latest-enrichment findings + what changed + attached excerpts). Returns
-   * `{ id, name, inventory_name, description, monitoring, stats, context }` where `context` is
-   * the ready-to-use text.
+   * An inventory as a one-shot, bounded context bundle with artifact provenance and delimiters.
+   * Returns `{ id, name, inventory_name, description, monitoring, stats, context }`. `context`
+   * starts with a safe prompt preamble that labels the enclosed inventory and artifact text as
+   * untrusted data.
    */
   async getInventoryContext(
     inventoryId: string,
@@ -608,8 +629,15 @@ export class InventoryManagerApi {
        *  `attachment_enrichment`). `undefined` (default) honors the inventory's saved toggle; `true`/`false`
        *  forces it for this run. */
       enrichAttachments?: boolean;
+      /** Fail before submitting if any requested attachment cannot be resolved. Defaults to `false` for
+       *  compatibility; permissive results carry `attachment_omissions` with an id and reason per skip. */
+      strictAttachments?: boolean;
     } = {},
   ): Promise<Record<string, unknown>> {
+    validatePollOptions(
+      options.pollIntervalMs ?? 3000,
+      options.timeoutMs ?? 300_000,
+    );
     const manifest = await this.getInventory(inventoryId);
     const items = Array.isArray(manifest.inventory)
       ? (manifest.inventory as unknown[])
@@ -620,6 +648,7 @@ export class InventoryManagerApi {
     let attachmentsText: string | undefined;
     let attachmentsFiles:
       Array<{ filename: string; content_b64: string }> | undefined;
+    let attachmentOmissions: AttachmentOmission[] = [];
     if (doAttach) {
       const ids = (
         Array.isArray(manifest.attached)
@@ -631,12 +660,21 @@ export class InventoryManagerApi {
       const resolved = await this.resolveAttachments(ids);
       attachmentsText = resolved.text;
       if (resolved.files.length) attachmentsFiles = resolved.files;
+      attachmentOmissions = resolved.omissions;
+      if (options.strictAttachments && attachmentOmissions.length) {
+        throw new Error(
+          `unable to resolve ${attachmentOmissions.length} requested attachment(s): ${attachmentOmissions
+            .map((omission) => omission.attachment_id)
+            .join(", ")}`,
+        );
+      }
     }
     const result = await this.enrichItems(items, {
       ...options,
       attachmentsText,
       attachmentsFiles,
     });
+    if (doAttach) result.attachment_omissions = attachmentOmissions;
     if (options.save && result.enrichment_id) {
       result.saved = await this.saveEnrichment(
         inventoryId,
@@ -646,16 +684,22 @@ export class InventoryManagerApi {
     return result;
   }
 
-  /** Fetch the inventory's attached artifacts (≤20) and split them for the engine: TEXT artifacts are
-   *  concatenated into `text`; BINARY ones (`X-Artifact-Format: file` — spreadsheets, PDF, scan XML) are
-   *  forwarded RAW (their stored base64) as `files` so the engine's parsers mine them. Best-effort —
-   *  per-text-attachment ≤80 KB, combined text ≤500 KB, files ≤20. */
+  /** Fetch the inventory's attached artifacts (≤20) and split them for the engine. Resolution is
+   *  permissive: every skipped attachment is returned in `omissions`; callers that need complete
+   *  evidence should use `enrichInventory({ strictAttachments: true })`. */
   async resolveAttachments(attachmentIds: string[]): Promise<{
     text?: string;
     files: Array<{ filename: string; content_b64: string }>;
+    omissions: AttachmentOmission[];
   }> {
     const parts: string[] = [];
     const files: Array<{ filename: string; content_b64: string }> = [];
+    const omissions: AttachmentOmission[] = attachmentIds
+      .slice(20)
+      .map((attachmentId) => ({
+        attachment_id: attachmentId,
+        reason: "attachment limit exceeded (maximum 20)",
+      }));
     let total = 0;
     for (const aid of attachmentIds.slice(0, 20)) {
       try {
@@ -665,7 +709,10 @@ export class InventoryManagerApi {
           { params: { raw: "1" } },
         );
         const content = await resp.text();
-        if (!content) continue;
+        if (!content) {
+          omissions.push({ attachment_id: aid, reason: "empty response body" });
+          continue;
+        }
         let name = aid;
         const encodedName = resp.headers.get("X-Artifact-Name");
         if (encodedName) {
@@ -676,21 +723,28 @@ export class InventoryManagerApi {
           }
         }
         if (resp.headers.get("X-Artifact-Format") === "file") {
-          // binary → forward to the engine's parsers
-          if (files.length < 20)
-            files.push({ filename: name, content_b64: content });
+          files.push({ filename: name, content_b64: content });
           continue;
         }
-        const chunk = content.slice(0, 80_000);
+        if (total >= 500_000) {
+          omissions.push({
+            attachment_id: aid,
+            reason: "combined attachment text limit exceeded",
+          });
+          continue;
+        }
+        const chunk = content.slice(0, Math.min(80_000, 500_000 - total));
         parts.push(`--- Attached: ${name} ---\n${chunk}`);
         total += chunk.length;
-        if (total >= 500_000) break;
-      } catch {
-        continue;
+      } catch (error) {
+        omissions.push({
+          attachment_id: aid,
+          reason: error instanceof Error ? error.message : String(error),
+        });
       }
     }
     const text = parts.join("\n\n");
-    return { text: text.trim() ? text.slice(0, 500_000) : undefined, files };
+    return { text: text.trim() ? text : undefined, files, omissions };
   }
 
   /**
@@ -731,6 +785,10 @@ export class InventoryManagerApi {
       attachmentsFiles?: Array<{ filename: string; content_b64: string }>;
     } = {},
   ): Promise<Record<string, unknown>> {
+    validatePollOptions(
+      options.pollIntervalMs ?? 3000,
+      options.timeoutMs ?? 300_000,
+    );
     const body: Record<string, unknown> = { items };
     if (options.include) body.include = options.include;
     if (options.attachmentsText)
@@ -742,7 +800,7 @@ export class InventoryManagerApi {
     ).json()) as { enrichment_id: string };
     const enrichmentId = submit.enrichment_id;
     const job = await pollUntilDone(
-      (m, p) => this.request(m, p),
+      (m, p, timeoutMs) => this.request(m, p, { timeoutMs }),
       enrichmentId,
       `/v1/inventory-enrich/${pathSegment(enrichmentId)}`,
       {

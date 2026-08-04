@@ -53,9 +53,11 @@ describe("enrich", () => {
     expect(body.text).toBe("CVE-2021-44228");
     expect(body.include).toEqual(["exploits"]);
     expect(body).not.toHaveProperty("save");
-    expect(new URL(String(mockFetch.mock.calls[1][0])).pathname).toBe(
-      `/v1/artifact-enrich/${ID}`,
-    );
+    // The poll call passes a `Request` so its deadline reaches the retry wrapper.
+    const polled = mockFetch.mock.calls[1][0];
+    expect(
+      new URL(polled instanceof Request ? polled.url : String(polled)).pathname,
+    ).toBe(`/v1/artifact-enrich/${ID}`);
     expect(mockFetch).toHaveBeenCalledTimes(3); // no save POST
   });
 
@@ -169,13 +171,14 @@ describe("enrich", () => {
     ).rejects.toBeInstanceOf(UnexpectedStatus);
   });
 
-  it("throws when the enrichment does not finish within the timeout", async () => {
+  it("rejects an invalid timeout", async () => {
     mockFetch
       .mockResolvedValueOnce(jsonResp(202, { enrichment_id: ID }))
       .mockResolvedValue(jsonResp(200, { status: "running" }));
     await expect(
       ws.enrich({ text: "x", pollIntervalMs: 0, timeoutMs: -1 }),
-    ).rejects.toThrow(/did not finish/);
+    ).rejects.toBeInstanceOf(RangeError);
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 });
 

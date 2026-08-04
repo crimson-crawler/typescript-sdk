@@ -10,7 +10,7 @@
  * is the engine's own status read. Exposed as `client.enricher` (mirrors the Python `EnricherAPI`).
  */
 
-import { ProgressCallback, pollUntilDone } from "./_poll";
+import { ProgressCallback, pollUntilDone, validatePollOptions } from "./_poll";
 import { UnexpectedStatus } from "./exceptions";
 import { pathSegment } from "./url";
 
@@ -44,12 +44,16 @@ export class EnricherApi {
   private async request(
     method: string,
     path: string,
-    opts: { params?: Record<string, string>; json?: unknown } = {},
+    opts: {
+      params?: Record<string, string>;
+      json?: unknown;
+      timeoutMs?: number;
+    } = {},
   ): Promise<Response> {
     const url = new URL(`${this.baseUrl}${path}`);
     for (const [k, v] of Object.entries(opts.params ?? {}))
       url.searchParams.set(k, v);
-    const resp = await this.doFetch(url, {
+    const init: RequestInit = {
       method,
       headers: {
         apikey: this.#apiKey,
@@ -58,7 +62,18 @@ export class EnricherApi {
           : {}),
       },
       ...(opts.json !== undefined ? { body: JSON.stringify(opts.json) } : {}),
-    });
+    };
+    const resp =
+      opts.timeoutMs === undefined
+        ? await this.doFetch(url, init)
+        : await this.doFetch(
+            new Request(url, {
+              ...init,
+              signal: AbortSignal.timeout(
+                Math.max(1, Math.ceil(opts.timeoutMs)),
+              ),
+            }),
+          );
     if (!resp.ok) {
       const body = await resp.text().catch(() => "");
       throw new UnexpectedStatus(
@@ -106,6 +121,10 @@ export class EnricherApi {
       newFolderName?: string | null;
     } = {},
   ): Promise<Record<string, unknown>> {
+    validatePollOptions(
+      options.pollIntervalMs ?? 3000,
+      options.timeoutMs ?? 300_000,
+    );
     const body: Record<string, unknown> = {};
     if (options.text) body.text = options.text;
     if (options.files) body.files = options.files;
@@ -118,7 +137,7 @@ export class EnricherApi {
     ).json()) as { enrichment_id: string };
     const enrichmentId = submit.enrichment_id;
     const job = await pollUntilDone(
-      (m, p) => this.request(m, p),
+      (m, p, timeoutMs) => this.request(m, p, { timeoutMs }),
       enrichmentId,
       `/v1/artifact-enrich/${pathSegment(enrichmentId)}`,
       {

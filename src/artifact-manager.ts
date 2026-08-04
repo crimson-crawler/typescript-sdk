@@ -21,6 +21,38 @@ export type ArtifactManagerFetch = (
   init?: RequestInit,
 ) => Promise<Response>;
 
+const MAX_BUFFERED_RAW_BYTES = 10_000_000;
+
+async function readBufferedText(resp: Response): Promise<string> {
+  const declared = Number(resp.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_BUFFERED_RAW_BYTES) {
+    await resp.body?.cancel().catch(() => undefined);
+    throw new RangeError(
+      `raw response exceeds the ${MAX_BUFFERED_RAW_BYTES}-byte buffer limit`,
+    );
+  }
+  if (!resp.body) return "";
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  const parts: string[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_BUFFERED_RAW_BYTES) {
+      await reader.cancel().catch(() => undefined);
+      throw new RangeError(
+        `raw response exceeds the ${MAX_BUFFERED_RAW_BYTES}-byte buffer limit`,
+      );
+    }
+    parts.push(decoder.decode(value, { stream: true }));
+  }
+  parts.push(decoder.decode());
+  return parts.join("");
+}
+
 function decodeHeader(value: string | null, fallback: string): string {
   if (!value) return fallback;
   try {
@@ -235,8 +267,8 @@ export class ArtifactManagerApi {
   }
 
   /**
-   * Stream an artifact's content as the raw body — the efficient way to pull a
-   * multi-MB enrichment report (no JSON re-wrap). Metadata rides `X-Artifact-*` headers.
+   * Read an artifact's raw body into a string buffer (maximum 10,000,000 bytes; this is not a
+   * streaming return type). Metadata rides `X-Artifact-*` headers.
    */
   async getArtifactRaw(
     artifactId: string,
@@ -249,7 +281,7 @@ export class ArtifactManagerApi {
       },
     );
     return {
-      content: await resp.text(),
+      content: await readBufferedText(resp),
       id: resp.headers.get("x-artifact-id") ?? artifactId,
       kind: resp.headers.get("x-artifact-kind") ?? "",
       name: decodeHeader(resp.headers.get("x-artifact-name"), artifactId),

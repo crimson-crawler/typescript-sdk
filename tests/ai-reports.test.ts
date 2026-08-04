@@ -72,7 +72,7 @@ describe("read + manage", () => {
     expect(lastCall().url.pathname).toBe("/ai-reports/reports/r1");
   });
 
-  it("getReportRaw streams body + headers", async () => {
+  it("getReportRaw buffers body + headers", async () => {
     mockFetch.mockResolvedValue(
       rawResp("<h1>R</h1>", {
         "x-artifact-id": "r1",
@@ -83,6 +83,15 @@ describe("read + manage", () => {
     expect(out.content).toBe("<h1>R</h1>");
     expect(out.format).toBe("html_report");
     expect(lastCall().url.searchParams.get("raw")).toBe("1");
+  });
+
+  it("getReportRaw rejects bodies above the documented buffer limit", async () => {
+    const response = rawResp("oversized", { "content-length": "10000001" });
+    const cancel = vi.spyOn(response.body!, "cancel");
+    mockFetch.mockResolvedValue(response);
+
+    await expect(ws.getReportRaw("r1")).rejects.toThrow(/10000000-byte/);
+    expect(cancel).toHaveBeenCalledOnce();
   });
 
   it("renameReport PATCHes name + unwraps report", async () => {

@@ -382,6 +382,12 @@ export class CrawlerClient {
             RETRYABLE_STATUS.has(resp.status) &&
             attempt < maxRetries
           ) {
+            try {
+              await resp.body?.cancel();
+            } catch {
+              // Releasing a discarded response is best-effort; cancellation
+              // failure must not mask the retryable status.
+            }
             await sleepBackoff(
               attempt,
               resp.headers.get("retry-after"),

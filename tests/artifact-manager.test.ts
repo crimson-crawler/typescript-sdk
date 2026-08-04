@@ -114,6 +114,18 @@ describe("artifacts", () => {
     expect(lastCall().url.searchParams.get("raw")).toBe("1");
   });
 
+  it("getArtifactRaw rejects bodies above the documented buffer limit", async () => {
+    const response = new Response("oversized", {
+      status: 200,
+      headers: { "content-length": "10000001" },
+    });
+    const cancel = vi.spyOn(response.body!, "cancel");
+    mockFetch.mockResolvedValue(response);
+
+    await expect(ws.getArtifactRaw("a1")).rejects.toThrow(/10000000-byte/);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it("getArtifactRaw falls back to the artifact id for a malformed encoded name", async () => {
     mockFetch.mockResolvedValue(
       new Response("content", {

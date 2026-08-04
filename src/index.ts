@@ -31,6 +31,7 @@ export {
 } from "./artifact-manager";
 export {
   InventoryManagerApi,
+  type AttachmentOmission,
   type InventoryOptions,
 } from "./inventory-manager";
 export { assembleBriefing, ingestScan } from "./ingest";

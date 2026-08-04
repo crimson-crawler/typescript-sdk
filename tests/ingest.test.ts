@@ -22,7 +22,11 @@ function jsonResp(status: number, body: unknown): Response {
 
 function lastCall(mock: Mock): { url: URL; init: RequestInit } {
   const [input, init] = mock.mock.calls.at(-1)!;
-  return { url: new URL(String(input)), init: init as RequestInit };
+  // The poll path hands fetch a `Request` — that is how a caller deadline reaches
+  // the retry wrapper and gets combined with the per-attempt timeout — while plain
+  // calls pass a `URL`. `String(new Request(...))` is "[object Request]".
+  const url = input instanceof Request ? input.url : String(input);
+  return { url: new URL(url), init: init as RequestInit };
 }
 
 let mockFetch: Mock;

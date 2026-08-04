@@ -1,6 +1,6 @@
 {
   "name": "@crimson-crawler/crimson-crawler-client",
-  "version": "4.1.0",
+  "version": "4.1.1",
   "description": "Typed TypeScript client for the Crimson Crawler API",
   "license": "Apache-2.0",
   "author": "Def-Logix, Inc.",
@@ -19,28 +19,64 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
-      "require": { "types": "./dist/index.d.cts", "default": "./dist/index.cjs" }
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     },
     "./presets": {
-      "import": { "types": "./dist/presets.d.ts", "default": "./dist/presets.js" },
-      "require": { "types": "./dist/presets.d.cts", "default": "./dist/presets.cjs" }
+      "import": {
+        "types": "./dist/presets.d.ts",
+        "default": "./dist/presets.js"
+      },
+      "require": {
+        "types": "./dist/presets.d.cts",
+        "default": "./dist/presets.cjs"
+      }
     },
     "./_generated": {
-      "import": { "types": "./dist/_generated/index.d.ts", "default": "./dist/_generated/index.js" },
-      "require": { "types": "./dist/_generated/index.d.cts", "default": "./dist/_generated/index.cjs" }
+      "import": {
+        "types": "./dist/_generated/index.d.ts",
+        "default": "./dist/_generated/index.js"
+      },
+      "require": {
+        "types": "./dist/_generated/index.d.cts",
+        "default": "./dist/_generated/index.cjs"
+      }
     },
     "./_generated/sdk.gen": {
-      "import": { "types": "./dist/_generated/sdk.gen.d.ts", "default": "./dist/_generated/sdk.gen.js" },
-      "require": { "types": "./dist/_generated/sdk.gen.d.cts", "default": "./dist/_generated/sdk.gen.cjs" }
+      "import": {
+        "types": "./dist/_generated/sdk.gen.d.ts",
+        "default": "./dist/_generated/sdk.gen.js"
+      },
+      "require": {
+        "types": "./dist/_generated/sdk.gen.d.cts",
+        "default": "./dist/_generated/sdk.gen.cjs"
+      }
     },
     "./_generated/types.gen": {
-      "import": { "types": "./dist/_generated/types.gen.d.ts", "default": "./dist/_generated/types.gen.js" },
-      "require": { "types": "./dist/_generated/types.gen.d.cts", "default": "./dist/_generated/types.gen.cjs" }
+      "import": {
+        "types": "./dist/_generated/types.gen.d.ts",
+        "default": "./dist/_generated/types.gen.js"
+      },
+      "require": {
+        "types": "./dist/_generated/types.gen.d.cts",
+        "default": "./dist/_generated/types.gen.cjs"
+      }
     },
     "./_generated/client.gen": {
-      "import": { "types": "./dist/_generated/client.gen.d.ts", "default": "./dist/_generated/client.gen.js" },
-      "require": { "types": "./dist/_generated/client.gen.d.cts", "default": "./dist/_generated/client.gen.cjs" }
+      "import": {
+        "types": "./dist/_generated/client.gen.d.ts",
+        "default": "./dist/_generated/client.gen.js"
+      },
+      "require": {
+        "types": "./dist/_generated/client.gen.d.cts",
+        "default": "./dist/_generated/client.gen.cjs"
+      }
     }
   },
   "files": [
@@ -86,7 +122,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "undici": "^7.28.0"
+    "undici": "^7.29.0"
   },
   "overrides": {
     "esbuild": "0.28.1",

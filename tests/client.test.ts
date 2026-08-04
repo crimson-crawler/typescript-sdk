@@ -140,4 +140,59 @@ describe("CrawlerClient instance scoping (createClient)", () => {
       fetchSpy.mockRestore();
     }
   });
+
+  it("cancels every discarded retry response body", async () => {
+    createClientMock.mockClear();
+    new CrawlerClient({
+      apiKey: "k",
+      baseUrl: "https://x.test",
+      maxRetries: 2,
+    });
+    const cfg = createClientMock.mock.calls[0][0] as { fetch: typeof fetch };
+    const first = new Response("retry one", { status: 503 });
+    const second = new Response("retry two", { status: 429 });
+    const firstCancel = vi.spyOn(first.body!, "cancel");
+    const secondCancel = vi.spyOn(second.body!, "cancel");
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(first)
+      .mockResolvedValueOnce(second)
+      .mockResolvedValueOnce(new Response("ok", { status: 200 }));
+    try {
+      await expect(cfg.fetch("https://x.test/v1")).resolves.toHaveProperty(
+        "status",
+        200,
+      );
+      expect(firstCancel).toHaveBeenCalledOnce();
+      expect(secondCancel).toHaveBeenCalledOnce();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("does not let response cancellation failure mask a retry", async () => {
+    createClientMock.mockClear();
+    new CrawlerClient({
+      apiKey: "k",
+      baseUrl: "https://x.test",
+      maxRetries: 1,
+    });
+    const cfg = createClientMock.mock.calls[0][0] as { fetch: typeof fetch };
+    const retry = new Response("retry", { status: 503 });
+    vi.spyOn(retry.body!, "cancel").mockRejectedValue(
+      new Error("cancel failed"),
+    );
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(retry)
+      .mockResolvedValueOnce(new Response("ok", { status: 200 }));
+    try {
+      await expect(cfg.fetch("https://x.test/v1")).resolves.toHaveProperty(
+        "status",
+        200,
+      );
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
 });

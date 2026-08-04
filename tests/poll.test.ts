@@ -5,7 +5,7 @@
  * callback, and callback-error swallowing for the two async engines.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Mock } from "vitest";
 
 import { UnexpectedStatus } from "../src/exceptions";
@@ -25,6 +25,10 @@ let mockRequest: Mock;
 
 beforeEach(() => {
   mockRequest = vi.fn();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe("pollUntilDone", () => {
@@ -69,15 +73,69 @@ describe("pollUntilDone", () => {
     expect(job.result).toEqual({ ok: true });
   });
 
-  it("throws when the deadline expires before the job finishes", async () => {
+  it("rejects invalid deadline and interval values", async () => {
     mockRequest.mockResolvedValue(jsonResp(200, { status: "running" }));
-
     await expect(
       pollUntilDone(mockRequest, ID, STATUS_PATH, {
         pollIntervalMs: 0,
         timeoutMs: -1,
       }),
+    ).rejects.toBeInstanceOf(RangeError);
+    await expect(
+      pollUntilDone(mockRequest, ID, STATUS_PATH, {
+        pollIntervalMs: Number.POSITIVE_INFINITY,
+        timeoutMs: 100,
+      }),
+    ).rejects.toBeInstanceOf(RangeError);
+  });
+
+  // These three attach the rejection expectation BEFORE advancing the clock. The poll
+  // rejects *during* `advanceTimersByTimeAsync`, so asserting afterwards leaves the
+  // rejection unhandled for a turn and Node reports it globally — vitest then exits
+  // non-zero with every test still passing.
+  it("enforces the deadline when a status request never settles", async () => {
+    vi.useFakeTimers();
+    mockRequest.mockReturnValue(new Promise<Response>(() => undefined));
+    const settled = expect(
+      pollUntilDone(mockRequest, ID, STATUS_PATH, {
+        pollIntervalMs: 1,
+        timeoutMs: 50,
+      }),
     ).rejects.toThrow(/did not finish/);
+    await vi.advanceTimersByTimeAsync(50);
+    await settled;
+    expect(mockRequest.mock.calls[0]?.[2]).toBeLessThanOrEqual(50);
+  });
+
+  it("enforces the deadline when onProgress never settles", async () => {
+    vi.useFakeTimers();
+    mockRequest.mockResolvedValue(jsonResp(200, { status: "running" }));
+    const settled = expect(
+      pollUntilDone(mockRequest, ID, STATUS_PATH, {
+        pollIntervalMs: 1,
+        timeoutMs: 50,
+        onProgress: () => new Promise<void>(() => undefined),
+      }),
+    ).rejects.toThrow(/did not finish/);
+    await vi.advanceTimersByTimeAsync(50);
+    await settled;
+  });
+
+  it("clamps a long poll sleep to the remaining deadline", async () => {
+    vi.useFakeTimers();
+    const timerSpy = vi.spyOn(globalThis, "setTimeout");
+    mockRequest.mockResolvedValue(jsonResp(200, { status: "running" }));
+    const settled = expect(
+      pollUntilDone(mockRequest, ID, STATUS_PATH, {
+        pollIntervalMs: 60_000,
+        timeoutMs: 75,
+      }),
+    ).rejects.toThrow(/did not finish/);
+    await vi.advanceTimersByTimeAsync(75);
+    await settled;
+    const delays = timerSpy.mock.calls.map((call) => Number(call[1]));
+    expect(delays.length).toBeGreaterThan(0);
+    expect(Math.max(...delays)).toBeLessThanOrEqual(75);
   });
 
   it("throws UnexpectedStatus on an engine-side error status", async () => {

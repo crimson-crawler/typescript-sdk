@@ -24,6 +24,38 @@ export type AiReportsFetch = (
   init?: RequestInit,
 ) => Promise<Response>;
 
+const MAX_BUFFERED_RAW_BYTES = 10_000_000;
+
+async function readBufferedText(resp: Response): Promise<string> {
+  const declared = Number(resp.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_BUFFERED_RAW_BYTES) {
+    await resp.body?.cancel().catch(() => undefined);
+    throw new RangeError(
+      `raw response exceeds the ${MAX_BUFFERED_RAW_BYTES}-byte buffer limit`,
+    );
+  }
+  if (!resp.body) return "";
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  const parts: string[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_BUFFERED_RAW_BYTES) {
+      await reader.cancel().catch(() => undefined);
+      throw new RangeError(
+        `raw response exceeds the ${MAX_BUFFERED_RAW_BYTES}-byte buffer limit`,
+      );
+    }
+    parts.push(decoder.decode(value, { stream: true }));
+  }
+  parts.push(decoder.decode());
+  return parts.join("");
+}
+
 function downloadFilename(disposition: string, fallback: string): string {
   let candidate: string | undefined;
   const encoded = disposition
@@ -134,7 +166,8 @@ export class AiReportsApi {
     return data.report;
   }
 
-  /** Stream a report's HTML as the raw body. Resolves `{ content, id, kind, name, format, createdAt }`. */
+  /** Read a report's raw HTML into a string buffer (maximum 10,000,000 bytes; not a streaming return type).
+   * Resolves `{ content, id, kind, name, format, createdAt }`. */
   async getReportRaw(reportId: string): Promise<Record<string, unknown>> {
     const resp = await this.request(
       "GET",
@@ -142,7 +175,7 @@ export class AiReportsApi {
       { params: { raw: "1" } },
     );
     return {
-      content: await resp.text(),
+      content: await readBufferedText(resp),
       id: resp.headers.get("x-artifact-id") ?? reportId,
       kind: resp.headers.get("x-artifact-kind") ?? "",
       name: resp.headers.get("x-artifact-name") ?? "",
