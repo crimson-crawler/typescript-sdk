@@ -170,6 +170,7 @@ jobs:
       contents: read
     outputs:
       publish: ${{ steps.registry.outputs.publish }}
+      bootstrap: ${{ steps.registry.outputs.bootstrap }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -185,7 +186,18 @@ jobs:
         id: registry
         env:
           RELEASE_TAG: ${{ github.ref_name }}
+          BOOTSTRAP_VERSION: ${{ vars.NPM_BOOTSTRAP_VERSION }}
         run: |
+          # Decide the bootstrap-vs-OIDC branch ONCE, here, and export it. `publish` runs with
+          # `environment: release`, and an environment-level variable shadows the repository one
+          # of the same name — so re-reading `vars.NPM_BOOTSTRAP_VERSION` there can yield a
+          # different value than this guard saw, which silently defeats the guard below. Deciding
+          # once and passing the result through `needs` removes that whole class of mismatch.
+          if [[ "$BOOTSTRAP_VERSION" == "$RELEASE_TAG" ]]; then
+            echo "bootstrap=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bootstrap=false" >> "$GITHUB_OUTPUT"
+          fi
           if python scripts/check-public-client-registry.py npm @crimson-crawler/crimson-crawler-client "${RELEASE_TAG#v}" distribution/*.tgz; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
           else
@@ -200,7 +212,7 @@ jobs:
       # fails during `publish`, *after* the Python SDK has already published to PyPI and
       # that version is permanently consumed. Fail here, before anything is irreversible.
       - name: Require the bootstrap credential on a first release
-        if: steps.registry.outputs.publish == 'true' && vars.NPM_BOOTSTRAP_VERSION != github.ref_name
+        if: steps.registry.outputs.publish == 'true' && steps.registry.outputs.bootstrap != 'true'
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           BOOTSTRAP_VERSION: ${{ vars.NPM_BOOTSTRAP_VERSION }}
@@ -243,7 +255,7 @@ jobs:
           name: distribution
           path: distribution
       - name: Bootstrap first npm release
-        if: vars.NPM_BOOTSTRAP_VERSION == github.ref_name
+        if: needs.registry.outputs.bootstrap == 'true'
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -252,10 +264,10 @@ jobs:
           umask 077
           printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > "$npmrc"
           trap 'rm -f "$npmrc"' EXIT
-          NPM_CONFIG_USERCONFIG="$npmrc" npm publish distribution/*.tgz --access public --provenance
+          NPM_CONFIG_USERCONFIG="$npmrc" npm publish ./distribution/*.tgz --access public --provenance
       - name: Publish with trusted publishing
-        if: vars.NPM_BOOTSTRAP_VERSION != github.ref_name
-        run: npm publish distribution/*.tgz --access public --provenance
+        if: needs.registry.outputs.bootstrap != 'true'
+        run: npm publish ./distribution/*.tgz --access public --provenance
 
   # Confirms the registry now serves files whose digests match the artifacts we attested.
   # `publish` is skipped on an idempotent rerun, and this still runs — comparing against
