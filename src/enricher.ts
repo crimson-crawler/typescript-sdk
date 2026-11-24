@@ -1,17 +1,20 @@
 /**
- * Enricher API — key-authed access to the async artifact-enrichment engine (submit → poll).
+ * Enricher API — key-authed access to the async enrichment engines (submit → poll).
  *
- * A thin wrapper over the `/v1/artifact-enrich` engine endpoints: `client.enricher.enrich` stages
- * artifacts, submits to the engine, polls until done, and returns the report. There is no save/discard —
- * the engine pair is submit→poll only; persistence is the portal's job, not the API's.
+ * Thin wrappers over the `/v1/artifact-enrich` + `/v1/event-enrich` engine endpoints:
+ * `client.enricher.enrich` stages artifacts, submits to the artifact engine, polls until done, and
+ * returns the report; `client.enricher.enrichEvent` submits a raw security event to the Event
+ * Enricher, polls until done, and returns the per-indicator result + aggregate verdict. There is no
+ * save/discard — the engine pair is submit→poll only; persistence is the portal's job, not the API's.
  *
  * Same API key, same base URL, same retry/timeout fetch as every other call. The enrichment submit is
- * enrichment compute and **counts toward your API usage** (it's a `/v1/artifact-enrich` request); polling
+ * enrichment compute and **counts toward your API usage** (it's a `/v1/*-enrich` request); polling
  * is the engine's own status read. Exposed as `client.enricher` (mirrors the Python `EnricherAPI`).
  */
 
 import { ProgressCallback, pollUntilDone, validatePollOptions } from "./_poll";
 import { UnexpectedStatus } from "./exceptions";
+import { type Tlp, validateTlp } from "./tlp";
 import { pathSegment } from "./url";
 
 /** A fetch-like function — the CrawlerClient hands in its retry/timeout wrapper. */
@@ -21,7 +24,7 @@ export type EnricherFetch = (
 ) => Promise<Response>;
 
 /**
- * Client for the artifact-enrichment engine (the async submit→poll lifecycle).
+ * Client for the async enrichment engines (submit→poll lifecycle: artifact + event).
  *
  * Obtained via `client.enricher` — never constructed directly.
  * Every method throws `UnexpectedStatus` on a non-2xx response.
@@ -88,8 +91,13 @@ export class EnricherApi {
   /**
    * Run an artifact enrichment end-to-end against the /v1 engine: submit → poll → return the report.
    *
-   * Stages pasted `text` + base64 `files` (`[{ filename, content_b64 }]`), submits to
-   * `/v1/artifact-enrich`, polls the job until done, and resolves to the enrichment report.
+   * Stages pasted `text` + base64 `files` (`[{ filename, content_b64, source_artifact_id? }]`), submits
+   * to `/v1/artifact-enrich`, polls the job until done, and resolves to the enrichment report.
+   *
+   * `texts` is the per-artifact form of `text` (`[{ text, source_artifact_id?, filename? }]`) — use it
+   * when the blocks came from several stored artifacts, so the report attributes each reference to the
+   * artifact it appeared in. `attachedArtifactIds` names the artifacts an opaque `text` blob came from;
+   * attribution is never inferred from the text itself.
    *
    * `stakeholder` is the optional SSVC stakeholder context applied to every reference when `include`
    * contains `"ssvc"` (`{ method, exposure, human_impact, mission_prevalence, public_wellbeing_impact }`;
@@ -97,15 +105,32 @@ export class EnricherApi {
    *
    * Counts toward your API usage (it's `/v1/artifact-enrich` compute). Throws `UnexpectedStatus` on a
    * non-2xx (or enrichment error), or `Error` if the enrichment doesn't finish within `timeoutMs`.
-   * Resolves to `{ enrichment_id, report }`.
+   * Resolves to `{ enrichment_id, report }`. `report` is the ArtifactEnrichmentReport (`report.meta.schema_version`):
+   * each reference carries its full record — CVSS vectors, EPSS percentile, NIST LEV (`lev`), CWEs, the CISA KEV record,
+   * Metasploit / Nuclei, OSV fixed versions, ATT&CK v18 detection data, knowledge-base profiles, threat actors
+   * targeting a country or sector, and `provenance`.
    */
   async enrich(
     options: {
       text?: string;
-      files?: Array<{ filename: string; content_b64: string }>;
+      texts?: Array<{
+        text: string;
+        source_artifact_id?: string | null;
+        filename?: string | null;
+      }>;
+      files?: Array<{
+        filename: string;
+        content_b64: string;
+        source_artifact_id?: string | null;
+      }>;
+      attachedArtifactIds?: string[];
       formats?: string[];
       include?: string[];
       stakeholder?: Record<string, unknown>;
+      /** TLP 2.0 marking written into the exported formats that carry one (`CLEAR` / `GREEN` / `AMBER` /
+       *  `AMBER+STRICT` / `RED`; default `AMBER`). An invalid value throws a `RangeError` before the
+       *  (billable) submit. */
+      tlp?: Tlp;
       pollIntervalMs?: number;
       timeoutMs?: number;
       /** Called with the live job (`{ status, progress, events }`, each event carrying the % it reached)
@@ -127,10 +152,15 @@ export class EnricherApi {
     );
     const body: Record<string, unknown> = {};
     if (options.text) body.text = options.text;
+    if (options.texts) body.texts = options.texts;
     if (options.files) body.files = options.files;
+    if (options.attachedArtifactIds)
+      body.attached_artifact_ids = options.attachedArtifactIds;
     if (options.formats) body.formats = options.formats;
     if (options.include) body.include = options.include;
     if (options.stakeholder) body.stakeholder = options.stakeholder;
+    const tlp = validateTlp(options.tlp);
+    if (tlp !== undefined) body.tlp = tlp;
 
     const submit = (await (
       await this.request("POST", "/v1/artifact-enrich", { json: body })
@@ -168,5 +198,53 @@ export class EnricherApi {
       ).json();
     }
     return result;
+  }
+
+  /**
+   * Run an Event Enrichment end-to-end against the /v1 engine: submit → poll → return the result.
+   *
+   * Submits a raw security event (a Defender XDR / Sentinel alert, a SIEM/EDR log line, any JSON or
+   * text) to `/v1/event-enrich`, polls the job until done, and resolves to
+   * `{ enrichment_id, result }` — where `result` is the EventEnrichmentResult (per-indicator
+   * findings + the aggregate event threat assessment). CC extracts every indicator server-side.
+   * Each CVE indicator carries `kev` and `weaponized` (a Metasploit module exists, which floors its
+   * verdict at high); `threat_assessment` counts both as `kev_count` / `weaponized_count`.
+   *
+   * Counts toward your API usage (it's `/v1/event-enrich` compute). Throws `UnexpectedStatus` on a
+   * non-2xx (or enrichment error), or `Error` if the enrichment doesn't finish within `timeoutMs`.
+   */
+  async enrichEvent(options: {
+    /** The raw event — a Defender XDR / Sentinel alert JSON, a log line, or any text (≤200,000 chars). */
+    event: string;
+    /** Optional caller-side event identifier (≤200 chars), echoed back on the result. */
+    eventId?: string;
+    pollIntervalMs?: number;
+    timeoutMs?: number;
+    /** Called with the live job on every poll — render a live bar / stream the per-indicator feed.
+     *  Polls are billing-exempt. */
+    onProgress?: ProgressCallback;
+  }): Promise<Record<string, unknown>> {
+    validatePollOptions(
+      options.pollIntervalMs ?? 1500,
+      options.timeoutMs ?? 1_200_000,
+    );
+    const body: Record<string, unknown> = { event: options.event };
+    if (options.eventId) body.event_id = options.eventId;
+
+    const submit = (await (
+      await this.request("POST", "/v1/event-enrich", { json: body })
+    ).json()) as { enrichment_id: string };
+    const enrichmentId = submit.enrichment_id;
+    const job = await pollUntilDone(
+      (m, p, timeoutMs) => this.request(m, p, { timeoutMs }),
+      enrichmentId,
+      `/v1/event-enrich/${pathSegment(enrichmentId)}`,
+      {
+        pollIntervalMs: options.pollIntervalMs ?? 1500,
+        timeoutMs: options.timeoutMs ?? 1_200_000,
+        onProgress: options.onProgress,
+      },
+    );
+    return { enrichment_id: enrichmentId, result: job.result };
   }
 }

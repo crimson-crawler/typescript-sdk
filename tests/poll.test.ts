@@ -2,7 +2,7 @@
  * Unit tests for the shared submit→poll core (`src/_poll.ts`).
  *
  * Mocks fetch — no network. Covers the deadline-based timeout, the progress
- * callback, and callback-error swallowing for the two async engines.
+ * callback, and callback-error swallowing for the three async engines.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";

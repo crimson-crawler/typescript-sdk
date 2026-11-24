@@ -8,6 +8,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { DEFAULT_MAX_RETRIES as ROOT_DEFAULT_MAX_RETRIES } from "../src/index";
 import {
   computeBackoff,
   DEFAULT_MAX_RETRIES,
@@ -29,6 +30,10 @@ describe("retry constants", () => {
     expect(RETRY_JITTER_RATIO).toBe(0.25);
     expect(RETRY_AFTER_MAX).toBe(60.0);
     expect(DEFAULT_MAX_RETRIES).toBe(2);
+  });
+
+  it("is re-exported from the package root, like the Python SDK's __init__", () => {
+    expect(ROOT_DEFAULT_MAX_RETRIES).toBe(DEFAULT_MAX_RETRIES);
   });
 
   it("retryable status set is exactly 429/502/503/504", () => {

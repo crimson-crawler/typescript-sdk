@@ -14,12 +14,14 @@
  *
  * const client = new CrawlerClient();
  * const result = await client.enrichCveFull("CVE-2024-3400");
- * console.log(result.cve?.cvss_score);
+ * console.log(result.cve?.cvss_v3_score, result.cve?.cvss_v4_score);
  * ```
  */
 
 import { client as defaultClient } from "./_generated/client.gen";
 import { createClient } from "./_generated/client";
+import { expandCveContext } from "./cve-catalog";
+import { collectSnapshotPages, iterOsvPages } from "./paging";
 import type { Client } from "./_generated/client";
 import {
   artifactEnrich,
@@ -32,10 +34,12 @@ import {
   enrichBatch,
   enrichCampaign,
   enrichCapec,
+  enrichCloak,
   enrichCve,
   enrichCwe,
   enrichDefend,
   enrichDisarm,
+  enrichF3,
   enrichGroup,
   enrichIoc,
   enrichLocation,
@@ -45,11 +49,14 @@ import {
   enrichSector,
   enrichSoftware,
   enrichTechnique,
+  eventEnrich,
+  eventEnrichStatus,
   inventoryEnrich,
   inventoryEnrichStatus,
   searchCti,
   searchCve,
   searchD3Fend,
+  searchCsaf,
   searchKev,
   searchKnowledgebase,
   searchMisp,
@@ -71,10 +78,12 @@ import type {
   EnrichBatchResponse,
   EnrichCampaignResponse,
   EnrichCapecResponse,
+  EnrichCloakResponse,
   EnrichCveResponse,
   EnrichCweResponse,
   EnrichDefendResponse,
   EnrichDisarmResponse,
+  EnrichF3Response,
   EnrichGroupResponse,
   EnrichIocResponse,
   EnrichLocationResponse,
@@ -84,9 +93,13 @@ import type {
   EnrichSectorResponse,
   EnrichSoftwareResponse,
   EnrichTechniqueResponse,
+  EventEnrichResponse,
+  EventEnrichStatusResponse,
   InventoryAsset,
   InventoryEnrichResponse,
   InventoryEnrichStatusResponse,
+  LogSource,
+  SearchCsafResponse,
   SearchCtiRequest,
   SearchCtiResponse,
   SearchCveRequest,
@@ -100,6 +113,7 @@ import type {
   SearchMispResponse,
   SearchPocResponse,
   SearchVendorResponse,
+  TechniqueDetail,
 } from "./_generated/types.gen";
 import { MissingCredentials, UnexpectedStatus } from "./exceptions";
 import { withApiKeyHeader } from "./_auth";
@@ -114,10 +128,12 @@ import {
   ATLAS_FULL,
   CAMPAIGN_FULL,
   CAPEC_FULL,
+  CLOAK_FULL,
   CVE_FULL_WALK,
   CWE_FULL_WALK,
   DEFEND_FULL,
   DISARM_FULL,
+  F3_FULL,
   GROUP_FULL,
   IOC_FULL_WALK,
   LOCATION_FULL,
@@ -449,7 +465,7 @@ export class CrawlerClient {
     this._aiReports = new AiReportsApi(this.baseUrl, apiKey, retryFetch);
   }
 
-  /** Underlying Hey API client, scoped to this instance. Use to call any of the 33 endpoints directly. */
+  /** Underlying Hey API client, scoped to this instance. Use to call any of the 37 `/v1` operations (31 synchronous + 6 async-engine) directly. */
   get api(): Client {
     return this._client;
   }
@@ -469,6 +485,8 @@ export class CrawlerClient {
    * artifacts + saved enrichment history) over the same key. Its own section at
    * `/inventory-manager/inventories/*` (outside the `/v1` OpenAPI contract). **Usage-exempt** except
    * `enrichInventory`'s submit, which is enrichment compute and counts toward your usage.
+   * For full log sources, PoCs, Sigma rules, or D3FEND rows, call `enrichCveFull` with the CVE ID,
+   * `techniques`, the base layer, and its `*_full` token.
    */
   get inventoryManager(): InventoryManagerApi {
     return this._inventoryManager;
@@ -497,27 +515,66 @@ export class CrawlerClient {
   /**
    * Walk the full CVE → CWE → CAPEC → ATT&CK → TIE chain plus MISP/knowledge base/web.
    *
+   * Returns one page. OSV advisories are paged: while `osv_next_offset` is set, request the next
+   * page with that offset and the response's `osv_snapshot_id`, or stream the whole walk with
+   * {@link iterCveOsvPages}.
+   *
    * @param cveId CVE identifier (e.g. `CVE-2024-3400`).
-   * @param include Override the default `CVE_FULL_WALK` chain.
+   * @param include Override `CVE_FULL_WALK`, which includes stored permissive OSV and Android
+   *   bulletin data. Restricted or unknown-licence OSV records require `osv_restricted`, which the
+   *   cursor is bound to.
+   * @param options `osvOffset` (from the previous page's `osv_next_offset`) and `osvSnapshotId`
+   *   (the previous page's `osv_snapshot_id`; required with a continuation). A continuation answers
+   *   409 `snapshot_expired` when its snapshot is gone and 503 `snapshot_unavailable` when the store is down.
    */
   async enrichCveFull(
     cveId: string,
     include: readonly string[] = CVE_FULL_WALK,
+    options: { osvOffset?: number; osvSnapshotId?: string } = {},
   ): Promise<EnrichCveResponse> {
     const result = await enrichCve({
       client: this._client,
-      body: { cve_id: cveId, include: [...include] },
+      body: {
+        cve_id: cveId,
+        include: [...include],
+        ...(options.osvOffset !== undefined && {
+          osv_offset: options.osvOffset,
+        }),
+        ...(options.osvSnapshotId !== undefined && {
+          osv_snapshot_id: options.osvSnapshotId,
+        }),
+      },
     });
     return ensureOk<EnrichCveResponse>(result);
   }
 
   /**
-   * Enrich an IOC against MISP, link to ATT&CK, and add knowledge base/web context.
+   * Stream every OSV advisory page of one CVE without an aggregate buffer. The first page is the
+   * complete enrichment; later pages repeat the request with the cursor and carry the next
+   * `osv_advisories` slice. A changed or expired snapshot throws `UnexpectedStatus` (409
+   * `snapshot_expired`) instead of restarting after a yield. The caller owns any collection bound;
+   * `osv_advisories_total` is exact.
+   */
+  async *iterCveOsvPages(
+    cveId: string,
+    include: readonly string[] = CVE_FULL_WALK,
+  ): AsyncGenerator<EnrichCveResponse> {
+    yield* iterOsvPages((osvOffset, osvSnapshotId) =>
+      this.enrichCveFull(cveId, include, {
+        osvOffset,
+        ...(osvSnapshotId !== undefined && { osvSnapshotId }),
+      }),
+    );
+  }
+
+  /**
+   * Enrich an IOC against MISP, link to ATT&CK, and add knowledge base context.
    *
    * @param value Indicator value (hash, IP, domain, URL).
    * @param iocType MISP-style attribute type — `ip-dst`, `ip-src`, `domain`,
    *   `hostname`, `md5`, `sha1`, `sha256`, `url`, etc. Defaults to `ip-dst`.
-   * @param include Override the default `IOC_FULL_WALK` chain.
+   * @param include Override `IOC_FULL_WALK`. `network_context` and `listed_on` are defaults;
+   *   `domain_context` and `hashlookup` remain explicit includes.
    */
   async enrichIocFull(
     value: string,
@@ -534,16 +591,20 @@ export class CrawlerClient {
   /**
    * Walk CWE → CAPEC → ATT&CK with TIE predictions.
    *
-   * @param cweId CWE identifier (e.g. `CWE-79`).
-   * @param include Override the default `CWE_FULL_WALK` chain.
+   * @param cweId CWE identifier (e.g. `CWE-79`). Supply this or `search`.
+   * @param options Optional `search` keyword (discover weaknesses by name) and `include` override.
    */
   async enrichCweFull(
-    cweId: string,
-    include: readonly string[] = CWE_FULL_WALK,
+    cweId: string | null = null,
+    options: { search?: string; include?: readonly string[] } = {},
   ): Promise<EnrichCweResponse> {
     const result = await enrichCwe({
       client: this._client,
-      body: { cwe_id: cweId, include: [...include] },
+      body: {
+        cwe_id: cweId ?? undefined,
+        search: options.search,
+        include: [...(options.include ?? CWE_FULL_WALK)],
+      },
     });
     return ensureOk<EnrichCweResponse>(result);
   }
@@ -552,19 +613,32 @@ export class CrawlerClient {
    * Enrich one or more ATT&CK techniques with TIE, adversary attribution,
    * and Navigator JSON.
    *
-   * @param techniqueIds ATT&CK technique IDs (e.g. `["T1190", "T1059.001"]`).
+   * @param techniqueIds ATT&CK technique IDs (e.g. `["T1190", "T1059.001"]`). Omit it when
+   *   looking up by `assetId`.
    * @param framework ATT&CK matrix variant — `enterprise`, `ics`, or `mobile`.
-   * @param include Override the default `TECHNIQUE_FULL` chain.
+   * @param include Override the default `TECHNIQUE_FULL` chain. `fraud` (opt-in) adds the MITRE
+   *   F3 fraud techniques whose borrowed ATT&CK ids resolve to each returned technique; the
+   *   other opt-ins are `fight` (FiGHT techniques by id), `lolbas` (facts-only binaries),
+   *   `sigma`, `lotl` (LOLDrivers plus the facts-only GTFOBins and HijackLibs rows mapped
+   *   onto the technique), `atomic_red_team` (Atomic Red Team tests: name, GUID, platforms,
+   *   executor and elevation flag, never a command body), `framework_mappings`, `asset_classes`, `log_sources` and
+   *   `analytic_details`.
+
+   * @param assetId ICS asset to look up from (e.g. `"A0002"`) — returns the techniques that
+   *   asset's classes target. Requires `framework: "ics"` and is mutually exclusive with
+   *   `techniqueIds`: it is a selector in its own right, not an added filter.
    */
   async enrichTechniqueFull(
-    techniqueIds: string[],
+    techniqueIds?: string[],
     framework: "enterprise" | "ics" | "mobile" = "enterprise",
     include: readonly string[] = TECHNIQUE_FULL,
+    assetId?: string,
   ): Promise<EnrichTechniqueResponse> {
     const result = await enrichTechnique({
       client: this._client,
       body: {
-        technique_ids: techniqueIds,
+        ...(techniqueIds !== undefined && { technique_ids: techniqueIds }),
+        ...(assetId !== undefined && { asset_id: assetId }),
         framework,
         include: [...include],
       },
@@ -573,10 +647,12 @@ export class CrawlerClient {
   }
 
   /**
-   * Find vulnerabilities affecting a product/version and enrich each matched CVE.
+   * Return one page of enriched CVEs for a product/version.
+   * For full log sources, PoCs, Sigma rules, or D3FEND rows, call `enrichCveFull` with the CVE ID,
+   * `techniques`, the base layer, and its `*_full` token.
    *
-   * @param product Product name (e.g. `"Apache HTTP Server"`, `"nginx"`).
-   * @param options Optional `version`, `vendor`, and `include` overrides.
+   * @param product Product name (e.g. `"http_server"`, `"nginx"`).
+   * @param options Optional version, vendor, include, limit, and offset. The full preset defaults to 2 CVEs per page.
    */
   async enrichProductFull(
     product: string,
@@ -584,6 +660,9 @@ export class CrawlerClient {
       version?: string;
       vendor?: string;
       include?: readonly string[];
+      limit?: number;
+      offset?: number;
+      snapshotId?: string;
     } = {},
   ): Promise<EnrichProductResponse> {
     const result = await enrichProduct({
@@ -592,10 +671,32 @@ export class CrawlerClient {
         product,
         ...(options.version !== undefined && { version: options.version }),
         ...(options.vendor !== undefined && { vendor: options.vendor }),
+        limit: options.limit ?? 2,
+        ...(options.offset !== undefined && { offset: options.offset }),
+        ...(options.snapshotId !== undefined && {
+          snapshot_id: options.snapshotId,
+        }),
         include: [...(options.include ?? PRODUCT_FULL)],
       },
     });
-    return ensureOk<EnrichProductResponse>(result);
+    return expandCveContext(ensureOk<EnrichProductResponse>(result));
+  }
+
+  async *iterProductCves(
+    product: string,
+    options: {
+      version?: string;
+      vendor?: string;
+      include?: readonly string[];
+      limit?: number;
+    } = {},
+  ): AsyncGenerator<EnrichProductResponse> {
+    const pages = await collectSnapshotPages(
+      (offset, snapshotId) =>
+        this.enrichProductFull(product, { ...options, offset, snapshotId }),
+      (page) => page.cves_next_offset,
+    );
+    yield* pages;
   }
 
   /**
@@ -616,6 +717,9 @@ export class CrawlerClient {
     options: {
       version?: string;
       include?: readonly string[];
+      limit?: number;
+      offset?: number;
+      snapshotId?: string;
     } = {},
   ): Promise<EnrichPackageResponse> {
     const result = await enrichPackage({
@@ -624,10 +728,60 @@ export class CrawlerClient {
         ecosystem,
         package: packageName,
         ...(options.version !== undefined && { version: options.version }),
+        limit: options.limit ?? 5,
+        ...(options.offset !== undefined && { offset: options.offset }),
+        ...(options.snapshotId !== undefined && {
+          snapshot_id: options.snapshotId,
+        }),
         include: [...(options.include ?? PACKAGE_FULL)],
       },
     });
-    return ensureOk<EnrichPackageResponse>(result);
+    return expandCveContext(ensureOk<EnrichPackageResponse>(result));
+  }
+
+  async *iterPackageAdvisories(
+    ecosystem: string,
+    packageName: string,
+    options: {
+      version?: string;
+      include?: readonly string[];
+      limit?: number;
+    } = {},
+  ): AsyncGenerator<EnrichPackageResponse> {
+    let offset = 0;
+    let snapshotId: string | undefined;
+    while (true) {
+      const page = await this.enrichPackageFull(ecosystem, packageName, {
+        ...options,
+        offset,
+        snapshotId,
+      });
+      if (
+        page.errors?.some(
+          (error) =>
+            error.service === "osv" &&
+            error.error === "stored_copy_unavailable",
+        )
+      ) {
+        throw new Error("stored_copy_unavailable");
+      }
+      if (snapshotId !== undefined && page.snapshot_id !== snapshotId) {
+        throw new Error("Enrichment returned a different snapshot identifier");
+      }
+      const nextOffset = page.next_offset;
+      if (
+        nextOffset != null &&
+        (!page.snapshot_id ||
+          !Number.isInteger(nextOffset) ||
+          nextOffset <= offset)
+      ) {
+        throw new Error("Enrichment returned an invalid package continuation");
+      }
+      yield page;
+      if (nextOffset == null) return;
+      offset = nextOffset;
+      snapshotId = page.snapshot_id ?? undefined;
+    }
   }
 
   /**
@@ -739,6 +893,33 @@ export class CrawlerClient {
   }
 
   /**
+   * Resolve a CLOAK concealment technique — details and knowledge base context.
+   *
+   * CLOAK objects carry no ATT&CK references, so there is no linked-technique layer:
+   * the response has no `linked_techniques` field at all.
+   *
+   * @param cloakId CLOAK identifier (e.g. `TTP-496`, or a technique slug such as `ta6-te129`).
+   * @param options Optional `search` keyword and `include` override (default `CLOAK_FULL`).
+   */
+  async enrichCloakFull(
+    cloakId?: string,
+    options: {
+      search?: string;
+      include?: readonly string[];
+    } = {},
+  ): Promise<EnrichCloakResponse> {
+    const result = await enrichCloak({
+      client: this._client,
+      body: {
+        ...(cloakId !== undefined && { cloak_id: cloakId }),
+        ...(options.search !== undefined && { search: options.search }),
+        include: [...(options.include ?? CLOAK_FULL)],
+      },
+    });
+    return ensureOk<EnrichCloakResponse>(result);
+  }
+
+  /**
    * Resolve a D3FEND defensive technique and the offensive techniques it counters.
    *
    * @param d3fendId D3FEND identifier (e.g. `D3-NTA`).
@@ -763,7 +944,11 @@ export class CrawlerClient {
   }
 
   /**
-   * Walk a DISARM disinformation technique to its countermeasures and ATT&CK mappings.
+   * Walk a DISARM disinformation technique to its family links and context.
+   *
+   * DISARM has no course-of-action objects and no ATT&CK-Enterprise-keyed actors/campaigns, so the
+   * response carries the technique, its DISARM family (`relatedDisarmTechniques`), and the
+   * knowledge-base / web / summary context — nothing else.
    *
    * @param techniqueId DISARM technique ID (e.g. `T0086`).
    * @param options Optional `search` keyword and `include` override (default `DISARM_FULL`).
@@ -787,6 +972,35 @@ export class CrawlerClient {
   }
 
   /**
+   * Walk a MITRE F3 fraud technique to the ATT&CK techniques it borrows.
+   *
+   * F3 borrows real ATT&CK `T####` ids for the techniques it shares with Enterprise
+   * ATT&CK, so a `T`-shaped id resolves here too. Unlike the other framework walks,
+   * calling with neither an id nor `search` is valid — the server answers 200 with
+   * nothing selected rather than rejecting the request.
+   *
+   * @param f3Id F3 identifier (e.g. `F1031`, `F1025.003`).
+   * @param options Optional `search` keyword and `include` override (default `F3_FULL`).
+   */
+  async enrichF3Full(
+    f3Id?: string,
+    options: {
+      search?: string;
+      include?: readonly string[];
+    } = {},
+  ): Promise<EnrichF3Response> {
+    const result = await enrichF3({
+      client: this._client,
+      body: {
+        ...(f3Id !== undefined && { f3_id: f3Id }),
+        ...(options.search !== undefined && { search: options.search }),
+        include: [...(options.include ?? F3_FULL)],
+      },
+    });
+    return ensureOk<EnrichF3Response>(result);
+  }
+
+  /**
    * Profile a threat actor: techniques, tooling, campaigns, exploited CVEs, and targeting.
    *
    * @param groupId ATT&CK group ID (e.g. `G0016`).
@@ -799,6 +1013,9 @@ export class CrawlerClient {
       search?: string;
       framework?: "enterprise" | "ics" | "mobile";
       include?: readonly string[];
+      limit?: number;
+      offset?: number;
+      snapshotId?: string;
     } = {},
   ): Promise<EnrichGroupResponse> {
     const result = await enrichGroup({
@@ -807,16 +1024,44 @@ export class CrawlerClient {
         ...(groupId !== undefined && { group_id: groupId }),
         ...(options.search !== undefined && { search: options.search }),
         framework: options.framework ?? "enterprise",
+        ...(options.limit !== undefined && { limit: options.limit }),
+        ...(options.offset !== undefined && { offset: options.offset }),
+        ...(options.snapshotId !== undefined && {
+          snapshot_id: options.snapshotId,
+        }),
         include: [...(options.include ?? GROUP_FULL)],
       },
     });
-    return ensureOk<EnrichGroupResponse>(result);
+    const page = ensureOk<EnrichGroupResponse>(result);
+    expandGroupCatalogue(
+      page.log_source_catalog,
+      page.log_source_refs,
+      page.group?.techniques,
+    );
+    return page;
+  }
+
+  async *iterGroupPages(
+    groupId?: string,
+    options: {
+      search?: string;
+      framework?: "enterprise" | "ics" | "mobile";
+      include?: readonly string[];
+      limit?: number;
+    } = {},
+  ): AsyncGenerator<EnrichGroupResponse> {
+    const pages = await collectSnapshotPages(
+      (offset, snapshotId) =>
+        this.enrichGroupFull(groupId, { ...options, offset, snapshotId }),
+      (page) => page.techniques_next_offset,
+    );
+    yield* pages;
   }
 
   /**
-   * Map a region's threat landscape — active groups, their techniques, and affected sectors.
+   * Map a region's profile — details plus knowledge base context.
    *
-   * @param locationId Region identifier (e.g. `UA`, or an ATT&CK location STIX ID).
+   * @param locationId Region identifier (e.g. `US`, or a STIX location ID).
    * @param options Optional `search` keyword and `include` override (default `LOCATION_FULL`).
    */
   async enrichLocationFull(
@@ -838,9 +1083,9 @@ export class CrawlerClient {
   }
 
   /**
-   * Map an industry sector's threat landscape — who targets it, how, and from where.
+   * Map an industry sector's profile — details plus knowledge base context.
    *
-   * @param sectorId Sector identifier (e.g. `energy`, or an ATT&CK sector STIX ID).
+   * @param sectorId Sector identifier (e.g. `energy`, or a STIX sector ID).
    * @param options Optional `search` keyword and `include` override (default `SECTOR_FULL`).
    */
   async enrichSectorFull(
@@ -907,7 +1152,21 @@ export class CrawlerClient {
       client: this._client,
       body: { items },
     });
-    return ensureOk<EnrichBatchResponse>(result);
+    const response = ensureOk<EnrichBatchResponse>(result);
+    for (const row of response.results ?? []) {
+      if ((row.type === "product" || row.type === "package") && row.data) {
+        expandCveContext(row.data as EnrichProductResponse);
+      }
+      if (row.type === "group" && row.data) {
+        const group = row.data as EnrichGroupResponse;
+        expandGroupCatalogue(
+          group.log_source_catalog,
+          group.log_source_refs,
+          group.group?.techniques,
+        );
+      }
+    }
+    return response;
   }
 
   /**
@@ -946,6 +1205,9 @@ export class CrawlerClient {
       search?: readonly string[];
       framework?: "enterprise" | "ics" | "mobile";
       include?: readonly string[];
+      limit?: number;
+      offset?: number;
+      snapshotId?: string;
     } = {},
   ): Promise<AssessGroupExposureResponse> {
     const result = await assessGroupExposure({
@@ -956,10 +1218,38 @@ export class CrawlerClient {
         }),
         ...(options.search !== undefined && { search: [...options.search] }),
         framework: options.framework ?? "enterprise",
+        ...(options.limit !== undefined && { limit: options.limit }),
+        ...(options.offset !== undefined && { offset: options.offset }),
+        ...(options.snapshotId !== undefined && {
+          snapshot_id: options.snapshotId,
+        }),
         ...(options.include !== undefined && { include: [...options.include] }),
       },
     });
-    return ensureOk<AssessGroupExposureResponse>(result);
+    const page = ensureOk<AssessGroupExposureResponse>(result);
+    expandGroupCatalogue(
+      page.log_source_catalog,
+      page.log_source_refs,
+      page.techniques,
+    );
+    return page;
+  }
+
+  async *iterGroupExposurePages(
+    options: {
+      groupIds?: readonly string[];
+      search?: readonly string[];
+      framework?: "enterprise" | "ics" | "mobile";
+      include?: readonly string[];
+      limit?: number;
+    } = {},
+  ): AsyncGenerator<AssessGroupExposureResponse> {
+    const pages = await collectSnapshotPages(
+      (offset, snapshotId) =>
+        this.assessGroupExposure({ ...options, offset, snapshotId }),
+      (page) => page.techniques_next_offset,
+    );
+    yield* pages;
   }
 
   /**
@@ -1009,15 +1299,22 @@ export class CrawlerClient {
   /**
    * Prioritize a set of CVEs — weaponization, exploit chains, and remediation order.
    *
+   * Returns one page. OSV advisories are aggregated across `cveIds` and paged: while
+   * `osv_next_offset` is set, request the next page with that offset and the response's
+   * `osv_snapshot_id`, or stream the whole walk with {@link iterVulnerabilityExposureOsvPages}.
+   *
    * @param cveIds CVE identifiers to assess.
-   * @param options Optional `include` layers and an SSVC `stakeholder` profile that
-   *   tunes the decision to your deployment.
+   * @param options Optional `include` layers (a continuation must repeat them; `osv_restricted`
+   *   is the licence opt-in), an SSVC `stakeholder` profile that tunes the decision to your
+   *   deployment, and the `osvOffset` / `osvSnapshotId` cursor from the previous page.
    */
   async assessVulnerabilityExposure(
     cveIds: readonly string[],
     options: {
       include?: readonly string[];
       stakeholder?: ArtifactEnrichmentStakeholder;
+      osvOffset?: number;
+      osvSnapshotId?: string;
     } = {},
   ): Promise<AssessVulnerabilityExposureResponse> {
     const result = await assessVulnerabilityExposure({
@@ -1028,9 +1325,36 @@ export class CrawlerClient {
         ...(options.stakeholder !== undefined && {
           stakeholder: options.stakeholder,
         }),
+        ...(options.osvOffset !== undefined && {
+          osv_offset: options.osvOffset,
+        }),
+        ...(options.osvSnapshotId !== undefined && {
+          osv_snapshot_id: options.osvSnapshotId,
+        }),
       },
     });
     return ensureOk<AssessVulnerabilityExposureResponse>(result);
+  }
+
+  /**
+   * Stream every OSV advisory page of a vulnerability-exposure assessment without an aggregate
+   * buffer. Same contract as {@link iterCveOsvPages}: the first page is the whole assessment, a
+   * changed or expired snapshot throws instead of restarting, and the caller owns any collection bound.
+   */
+  async *iterVulnerabilityExposureOsvPages(
+    cveIds: readonly string[],
+    options: {
+      include?: readonly string[];
+      stakeholder?: ArtifactEnrichmentStakeholder;
+    } = {},
+  ): AsyncGenerator<AssessVulnerabilityExposureResponse> {
+    yield* iterOsvPages((osvOffset, osvSnapshotId) =>
+      this.assessVulnerabilityExposure(cveIds, {
+        ...options,
+        osvOffset,
+        ...(osvSnapshotId !== undefined && { osvSnapshotId }),
+      }),
+    );
   }
 
   // -- Search ------------------------------------------------------------ //
@@ -1057,6 +1381,8 @@ export class CrawlerClient {
       page?: number;
       deprecated?: boolean;
       revoked?: boolean;
+      /** Extra layers. Only `["kb_versions"]` — installed/available revision per source. */
+      include?: readonly string[];
     } = {},
   ): Promise<SearchCtiResponse> {
     const result = await searchCti({
@@ -1071,6 +1397,7 @@ export class CrawlerClient {
           deprecated: options.deprecated,
         }),
         ...(options.revoked !== undefined && { revoked: options.revoked }),
+        ...(options.include !== undefined && { include: [...options.include] }),
       },
     });
     return ensureOk<SearchCtiResponse>(result);
@@ -1085,6 +1412,9 @@ export class CrawlerClient {
    *
    * @param query Free-text query. Omit it to filter purely on the structured fields.
    * @param options Any combination of the corpus filters, plus `sort`, `limit`, `page`.
+   *   `include` replaces the server defaults: `details`, `statistics`, `cna`, `epss_reports`,
+   *   and `kb_rankings` default on. `kb_rankings` keeps the top 100 rows per KB without yearly
+   *   trends; `kb_rankings_full` restores all fetched rows and trends.
    */
   async searchCve(
     query?: string,
@@ -1170,7 +1500,9 @@ export class CrawlerClient {
    * Search the D3FEND defensive-countermeasure ontology.
    *
    * @param query Free-text query (e.g. `"network traffic analysis"`).
-   * @param options `d3fendForm` to scope to a tactic/mitigation/artifact, plus `limit`, `page`.
+   * @param options `d3fendForm` to scope to a tactic/mitigation/artifact, plus `limit`, `page`,
+   *   and `include`. `versions` defaults on and attaches each returned technique's revision history.
+   *   An explicit include replaces the defaults; pass `[]` to omit all optional layers.
    */
   async searchD3fend(
     query: string,
@@ -1178,6 +1510,7 @@ export class CrawlerClient {
       d3fendForm?: NonNullable<SearchD3FendRequest["d3fend_form"]>;
       limit?: number;
       page?: number;
+      include?: readonly string[];
     } = {},
   ): Promise<SearchD3FendResponse> {
     const result = await searchD3Fend({
@@ -1189,6 +1522,7 @@ export class CrawlerClient {
         }),
         limit: options.limit ?? 20,
         page: options.page ?? 1,
+        ...(options.include !== undefined && { include: [...options.include] }),
       },
     });
     return ensureOk<SearchD3FendResponse>(result);
@@ -1199,7 +1533,9 @@ export class CrawlerClient {
    *
    * An empty call pages the whole catalog; `cveId` checks one CVE's KEV status.
    *
-   * @param options `cveId`, `ransomwareStatus`, `limit`, `page`.
+   * @param options `cveId`, `ransomwareStatus`, `limit`, `page`, and `include`. `statistics`
+   *   defaults on for deployment-wide corpus coverage. An explicit include replaces the defaults;
+   *   pass `[]` to omit all optional layers.
    */
   async searchKev(
     options: {
@@ -1207,6 +1543,7 @@ export class CrawlerClient {
       ransomwareStatus?: NonNullable<SearchKevRequest["ransomware_status"]>;
       limit?: number;
       page?: number;
+      include?: readonly string[];
     } = {},
   ): Promise<SearchKevResponse> {
     const result = await searchKev({
@@ -1218,9 +1555,52 @@ export class CrawlerClient {
         }),
         limit: options.limit ?? 50,
         page: options.page ?? 1,
+        ...(options.include !== undefined && { include: [...options.include] }),
       },
     });
     return ensureOk<SearchKevResponse>(result);
+  }
+
+  /**
+   * Search the seeded CSAF vendor-advisory corpus.
+   *
+   * Filters combine with AND; this is the door for CVE-less advisories (publisher, sector,
+   * product, CPE, TLP). `total` is the unpaginated match count.
+   */
+  async searchCsaf(
+    options: {
+      cveId?: string;
+      advisoryId?: string;
+      publisher?: string;
+      sector?: string;
+      product?: string;
+      cpe?: string;
+      tlp?: string;
+      sort?: "newest" | "oldest";
+      limit?: number;
+      page?: number;
+    } = {},
+  ): Promise<SearchCsafResponse> {
+    const result = await searchCsaf({
+      client: this._client,
+      body: {
+        ...(options.cveId !== undefined && { cve_id: options.cveId }),
+        ...(options.advisoryId !== undefined && {
+          advisory_id: options.advisoryId,
+        }),
+        ...(options.publisher !== undefined && {
+          publisher: options.publisher,
+        }),
+        ...(options.sector !== undefined && { sector: options.sector }),
+        ...(options.product !== undefined && { product: options.product }),
+        ...(options.cpe !== undefined && { cpe: options.cpe }),
+        ...(options.tlp !== undefined && { tlp: options.tlp }),
+        sort: options.sort ?? "newest",
+        limit: options.limit ?? 20,
+        page: options.page ?? 1,
+      },
+    });
+    return ensureOk<SearchCsafResponse>(result);
   }
 
   /**
@@ -1253,11 +1633,20 @@ export class CrawlerClient {
   }
 
   /**
-   * Search MISP events and attributes.
+   * Search our curated MISP (public threat feeds) for events and attributes.
+   * Feed list: https://crimsoncrawler.com/docs/guides/data-sources/#our-curated-misp.
    *
    * @param options Attribute filters (`value`, `typeAttribute`, `category`, `toIds`),
    *   event filters (`eventId`, `eventinfo`, `tags`, `threatLevelId`, `published`),
    *   a `dateFrom`/`dateTo` window, plus `limit` and `page`.
+   *   `include` takes any of `"sightings"` (asks MISP for the inline `Sighting` array so each
+   *   attribute's `sightings[]`/`sighting_count` and each returned event's sightings are real
+   *   counts instead of 0), `"event_reports"` (the analyst-written markdown narratives for the
+   *   matched events), `"stats"` (per-event attribute/object/sighting counts), `"tags"` (the
+   *   instance's tag vocabulary), `"feeds"` (feed previews), `"objects"` (full event bodies with
+   *   resolved references), `"misp_events_full"` (full event bodies), and `"version"`. Events
+   *   otherwise return summaries; `misp_events_total` is null when unknown.
+   *   Omit `include` for event reports, tags and version; pass `[]` to omit them.
    */
   async searchMisp(
     options: {
@@ -1272,6 +1661,7 @@ export class CrawlerClient {
       published?: boolean;
       dateFrom?: string;
       dateTo?: string;
+      include?: readonly string[];
       limit?: number;
       page?: number;
     } = {},
@@ -1298,6 +1688,7 @@ export class CrawlerClient {
         }),
         ...(options.dateFrom !== undefined && { date_from: options.dateFrom }),
         ...(options.dateTo !== undefined && { date_to: options.dateTo }),
+        ...(options.include !== undefined && { include: [...options.include] }),
         limit: options.limit ?? 50,
         page: options.page ?? 1,
       },
@@ -1336,13 +1727,14 @@ export class CrawlerClient {
    * @param options Optional `limit` (default 50).
    */
   async searchVendor(
-    vendor: string,
-    options: { limit?: number } = {},
+    vendor?: string | null,
+    options: { q?: string; limit?: number } = {},
   ): Promise<SearchVendorResponse> {
     const result = await searchVendor({
       client: this._client,
       body: {
-        vendor,
+        vendor: vendor ?? undefined,
+        q: options.q,
         limit: options.limit ?? 50,
       },
     });
@@ -1369,21 +1761,35 @@ export class CrawlerClient {
   async artifactEnrich(
     options: {
       text?: string;
-      files?: ArtifactEnrichmentDocRequest["files"];
+      texts?: Array<{
+        text: string;
+        source_artifact_id?: string | null;
+        filename?: string | null;
+      }>;
+      files?: Array<{
+        filename: string;
+        content_b64: string;
+        source_artifact_id?: string | null;
+      }>;
       formats?: ArtifactEnrichmentDocRequest["formats"];
       include?: readonly string[];
       stakeholder?: ArtifactEnrichmentStakeholder;
+      attachedArtifactIds?: string[];
     } = {},
   ): Promise<ArtifactEnrichResponse> {
     const result = await artifactEnrich({
       client: this._client,
       body: {
         ...(options.text !== undefined && { text: options.text }),
+        ...(options.texts !== undefined && { texts: options.texts }),
         ...(options.files !== undefined && { files: options.files }),
         ...(options.formats !== undefined && { formats: options.formats }),
         ...(options.include !== undefined && { include: [...options.include] }),
         ...(options.stakeholder !== undefined && {
           stakeholder: options.stakeholder,
+        }),
+        ...(options.attachedArtifactIds !== undefined && {
+          attached_artifact_ids: options.attachedArtifactIds,
         }),
       },
     });
@@ -1413,15 +1819,31 @@ export class CrawlerClient {
    * fleet-level risk picture.
    *
    * @param items Assets to enrich, each at minimum `{ product }`.
-   * @param options Optional `attachmentsText`/`attachmentsFiles` for extra context
-   *   and per-asset CVE `include` layers.
+   * @param options Optional attachment context — `attachmentsText` (one opaque blob),
+   *   `attachmentsTexts` (one `{ text, source_artifact_id?, filename? }` entry per artifact, so
+   *   each block keeps its own attribution), `attachedArtifactIds` (the artifacts an opaque
+   *   `attachmentsText` came from) and `attachmentsFiles` (raw binary the engine parses) — plus
+   *   per-asset CVE `include` layers and `vexOverlay` — an OpenVEX 0.2.0 / CSAF 2.0 VEX
+   *   document (text) whose `not_affected`/`fixed` statements mark matching findings
+   *   `suppressed_by_vex` (retained + justification, excluded from the actionable counts).
    */
   async inventoryEnrich(
     items: readonly InventoryAsset[],
     options: {
       attachmentsText?: string;
-      attachmentsFiles?: ArtifactEnrichmentDocRequest["files"];
+      attachmentsTexts?: Array<{
+        text: string;
+        source_artifact_id?: string | null;
+        filename?: string | null;
+      }>;
+      attachedArtifactIds?: string[];
+      attachmentsFiles?: Array<{
+        filename: string;
+        content_b64: string;
+        source_artifact_id?: string | null;
+      }>;
       include?: readonly string[];
+      vexOverlay?: string;
     } = {},
   ): Promise<InventoryEnrichResponse> {
     const result = await inventoryEnrich({
@@ -1431,10 +1853,19 @@ export class CrawlerClient {
         ...(options.attachmentsText !== undefined && {
           attachments_text: options.attachmentsText,
         }),
+        ...(options.attachmentsTexts !== undefined && {
+          attachments_texts: options.attachmentsTexts,
+        }),
+        ...(options.attachedArtifactIds !== undefined && {
+          attached_artifact_ids: options.attachedArtifactIds,
+        }),
         ...(options.attachmentsFiles !== undefined && {
           attachments_files: options.attachmentsFiles,
         }),
         ...(options.include !== undefined && { include: [...options.include] }),
+        ...(options.vexOverlay !== undefined && {
+          vex_overlay: { format: "vex" as const, content: options.vexOverlay },
+        }),
       },
     });
     return ensureOk<InventoryEnrichResponse>(result);
@@ -1454,12 +1885,71 @@ export class CrawlerClient {
     });
     return ensureOk<InventoryEnrichStatusResponse>(result);
   }
+
+  /**
+   * Submit a raw security event to the async Event Enricher engine.
+   *
+   * Returns immediately with an `enrichment_id` — poll {@link eventEnrichStatus}
+   * for the result (per-indicator findings + the aggregate event threat
+   * assessment), or use {@link enricher}.`enrichEvent` to run the whole lifecycle.
+   * CC extracts every indicator server-side — you do NOT pre-parse the alert.
+   *
+   * @param event The raw event — a Defender XDR / Sentinel alert JSON, a SIEM/EDR
+   *   log line, or any text (≤200,000 chars).
+   * @param options.eventId Optional caller-side event identifier (≤200 chars), echoed back on the result.
+   */
+  async eventEnrich(
+    event: string,
+    options: { eventId?: string } = {},
+  ): Promise<EventEnrichResponse> {
+    const result = await eventEnrich({
+      client: this._client,
+      body: {
+        event,
+        ...(options.eventId !== undefined && { event_id: options.eventId }),
+      },
+    });
+    return ensureOk<EventEnrichResponse>(result);
+  }
+
+  /**
+   * Read the progress or result of an event enrichment.
+   *
+   * @param enrichmentId The `enrichment_id` returned by {@link eventEnrich}.
+   */
+  async eventEnrichStatus(
+    enrichmentId: string,
+  ): Promise<EventEnrichStatusResponse> {
+    const result = await eventEnrichStatus({
+      client: this._client,
+      path: { enrichment_id: enrichmentId },
+    });
+    return ensureOk<EventEnrichStatusResponse>(result);
+  }
 }
 
 interface HeyApiResult {
   data?: unknown;
   error?: unknown;
   response?: Response;
+}
+
+function expandGroupCatalogue(
+  catalog: LogSource[] | undefined,
+  refs: Record<string, number[]> | undefined,
+  rows: (string | TechniqueDetail)[] | undefined,
+): void {
+  if (!catalog || !refs || !rows) return;
+  for (const row of rows) {
+    if (typeof row === "string") continue;
+    const indices = refs[row.technique_id] ?? [];
+    if (
+      indices.some((i) => !Number.isInteger(i) || i < 0 || i >= catalog.length)
+    ) {
+      throw new Error("Invalid group log-source catalogue reference");
+    }
+    if (indices.length) row.log_sources = indices.map((i) => catalog[i]!);
+  }
 }
 
 function ensureOk<T>(result: HeyApiResult): T {

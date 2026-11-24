@@ -476,7 +476,9 @@ describe("attachment resolution", () => {
       }),
     );
     const out = await ws.resolveAttachments(["a1"]);
-    expect(out.text).toContain("--- Attached: a1 ---");
+    expect(out.texts).toEqual([
+      { text: "notes", source_artifact_id: "a1", filename: "a1" },
+    ]);
   });
 });
 
@@ -641,6 +643,52 @@ describe("import/export", () => {
   });
 });
 
+describe("tlp marking", () => {
+  it("exportInventory sends every accepted value on a slot-carrying format", async () => {
+    for (const tlp of [
+      "CLEAR",
+      "GREEN",
+      "AMBER",
+      "AMBER+STRICT",
+      "RED",
+    ] as const) {
+      mockFetch.mockResolvedValueOnce(new Response("{}", { status: 200 }));
+      await ws.exportInventory("p1", "cyclonedx", { tlp });
+      expect(lastCall().url.searchParams.get("tlp")).toBe(tlp);
+    }
+  });
+
+  it("exportInventory encodes `+` so AMBER+STRICT is distinguishable from a space", async () => {
+    mockFetch.mockResolvedValueOnce(new Response("{}", { status: 200 }));
+    await ws.exportInventory("p1", "cyclonedx", { tlp: "AMBER+STRICT" });
+    expect(lastCall().url.search).toContain("tlp=AMBER%2BSTRICT");
+  });
+
+  it("exportInventory forwards tlp on the bulk `all` zip", async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(new Uint8Array([0x50, 0x4b]), { status: 200 }),
+    );
+    await ws.exportInventory("p1", "all", { tlp: "RED" });
+    expect(lastCall().url.searchParams.get("tlp")).toBe("RED");
+  });
+
+  it("exportInventory omits the param when tlp is unset", async () => {
+    mockFetch.mockResolvedValueOnce(new Response("{}", { status: 200 }));
+    await ws.exportInventory("p1", "cyclonedx");
+    expect(lastCall().url.search).toBe("");
+  });
+
+  it("exportInventory rejects an invalid value with RangeError before any request", async () => {
+    await expect(
+      ws.exportInventory("p1", "cyclonedx", { tlp: "WHITE" as never }),
+    ).rejects.toThrow(RangeError);
+    await expect(
+      ws.exportInventory("p1", "cyclonedx", { tlp: "amber" as never }),
+    ).rejects.toThrow(RangeError);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+});
+
 describe("asset edit", () => {
   it("replaces assets (preserving everything else)", async () => {
     mockFetch.mockResolvedValue(
@@ -709,6 +757,23 @@ describe("asset edit", () => {
       product: "nginx",
       version: "1.27.4",
       vendor: "f5",
+    });
+  });
+
+  it("scopes a fix to one host via `group`", async () => {
+    mockFetch.mockResolvedValue(
+      jsonResp(200, {
+        id: "p1",
+        product: "nginx",
+        version: "1.27.4",
+        applied: 1,
+      }),
+    );
+    await ws.applyAssetFix("p1", "nginx", "1.27.4", undefined, "web-01");
+    expect(JSON.parse(String(lastCall().init.body))).toEqual({
+      product: "nginx",
+      version: "1.27.4",
+      group: "web-01",
     });
   });
 
@@ -929,7 +994,13 @@ describe("enrichInventory artifact-scans (attachments)", () => {
     const submitBody = JSON.parse(
       (mockFetch.mock.calls[2][1] as RequestInit).body as string,
     );
-    expect(submitBody.attachments_text).toContain("CVE-2024-9999");
+    expect(submitBody.attachments_texts).toEqual([
+      {
+        text: "CVE-2024-9999 at 1.2.3.4",
+        source_artifact_id: "att-1",
+        filename: "att-1",
+      },
+    ]);
   });
 
   it("forwards a binary attachment as a file (X-Artifact-Format: file)", async () => {
@@ -957,9 +1028,13 @@ describe("enrichInventory artifact-scans (attachments)", () => {
     const submitBody = JSON.parse(
       (mockFetch.mock.calls[2][1] as RequestInit).body as string,
     );
-    expect(submitBody.attachments_text).toBeUndefined();
+    expect(submitBody.attachments_texts).toBeUndefined();
     expect(submitBody.attachments_files).toEqual([
-      { filename: "scan.xlsx", content_b64: "UEsDBASE64XLSX" },
+      {
+        filename: "scan.xlsx",
+        content_b64: "UEsDBASE64XLSX",
+        source_artifact_id: "att-x",
+      },
     ]);
   });
 
@@ -1018,5 +1093,139 @@ describe("enrichInventory artifact-scans (attachments)", () => {
       .mockResolvedValueOnce(jsonResp(200, { status: "done", result: {} }));
     await ws.enrichInventory("p1", { pollIntervalMs: 0 });
     expect(mockFetch).toHaveBeenCalledTimes(3); // no get_artifact
+  });
+});
+
+describe("enrichInventory — VEX suppression overlay (#324)", () => {
+  const ID = "e".repeat(32);
+  const DOC = '{"@context":"https://openvex.dev/ns/v0.2.0","statements":[]}';
+
+  it("sends the inventory's attached overlay as the engine's vex_overlay", async () => {
+    mockFetch
+      .mockResolvedValueOnce(
+        jsonResp(200, {
+          inventory: [{ product: "nginx" }],
+          vex_overlay: { dialect: "openvex", document: DOC, statements: [] },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResp(202, { enrichment_id: ID }))
+      .mockResolvedValueOnce(jsonResp(200, { status: "done", result: {} }));
+    await ws.enrichInventory("p1", { pollIntervalMs: 0 });
+    expect(new URL(String(mockFetch.mock.calls[1][0])).pathname).toBe(
+      "/v1/inventory-enrich",
+    );
+    const submitBody = JSON.parse(
+      (mockFetch.mock.calls[1][1] as RequestInit).body as string,
+    );
+    expect(submitBody.vex_overlay).toEqual({ format: "vex", content: DOC });
+  });
+
+  it("omits vex_overlay when the inventory has none", async () => {
+    mockFetch
+      .mockResolvedValueOnce(
+        jsonResp(200, { inventory: [{ product: "nginx" }], vex_overlay: null }),
+      )
+      .mockResolvedValueOnce(jsonResp(202, { enrichment_id: ID }))
+      .mockResolvedValueOnce(jsonResp(200, { status: "done", result: {} }));
+    await ws.enrichInventory("p1", { pollIntervalMs: 0 });
+    const submitBody = JSON.parse(
+      (mockFetch.mock.calls[1][1] as RequestInit).body as string,
+    );
+    expect("vex_overlay" in submitBody).toBe(false);
+  });
+
+  it("enrichItems accepts an explicit vexOverlay", async () => {
+    mockFetch
+      .mockResolvedValueOnce(jsonResp(202, { enrichment_id: ID }))
+      .mockResolvedValueOnce(jsonResp(200, { status: "done", result: {} }));
+    await ws.enrichItems([{ product: "nginx" }], {
+      pollIntervalMs: 0,
+      vexOverlay: "{}",
+    });
+    const submitBody = JSON.parse(
+      (mockFetch.mock.calls[0][1] as RequestInit).body as string,
+    );
+    expect(submitBody.vex_overlay).toEqual({ format: "vex", content: "{}" });
+  });
+});
+
+describe("history", () => {
+  it("getHistory hits the route with filters and omits unset", async () => {
+    mockFetch.mockResolvedValue(
+      jsonResp(200, { items: [], next_cursor: null }),
+    );
+    const page = await ws.getHistory("p1", {
+      types: ["assets_changed", "renamed"],
+      q: "log4j",
+      actor: "api",
+      limit: 25,
+      cursor: "c1",
+    });
+    expect(page).toEqual({ items: [], next_cursor: null });
+    const { url } = lastCall();
+    expect(url.pathname).toBe("/inventory-manager/inventories/p1/history");
+    expect(url.searchParams.get("type")).toBe("assets_changed,renamed");
+    expect(url.searchParams.get("q")).toBe("log4j");
+    expect(url.searchParams.get("actor")).toBe("api");
+    expect(url.searchParams.get("limit")).toBe("25");
+    expect(url.searchParams.get("cursor")).toBe("c1");
+    expect(url.searchParams.has("since")).toBe(false);
+  });
+
+  it("getHistory with no options sends no query string", async () => {
+    mockFetch.mockResolvedValue(
+      jsonResp(200, { items: [], next_cursor: null }),
+    );
+    await ws.getHistory("p1");
+    expect(lastCall().url.search).toBe("");
+  });
+
+  it("getHistory passes a comma string of types through", async () => {
+    mockFetch.mockResolvedValue(
+      jsonResp(200, { items: [], next_cursor: null }),
+    );
+    await ws.getHistory("p1", { types: "tlp_changed,vex_changed" });
+    expect(lastCall().url.searchParams.get("type")).toBe(
+      "tlp_changed,vex_changed",
+    );
+  });
+
+  it("getHistory surfaces a bad param as UnexpectedStatus", async () => {
+    mockFetch.mockResolvedValue(
+      jsonResp(400, { error: "limit must be 1-200" }),
+    );
+    await expect(ws.getHistory("p1", { limit: 500 })).rejects.toBeInstanceOf(
+      UnexpectedStatus,
+    );
+  });
+
+  it("iterHistory follows next_cursor until exhausted", async () => {
+    mockFetch
+      .mockResolvedValueOnce(
+        jsonResp(200, { items: [{ id: "a" }, { id: "b" }], next_cursor: "c2" }),
+      )
+      .mockResolvedValueOnce(
+        jsonResp(200, { items: [{ id: "c" }], next_cursor: null }),
+      );
+    const seen: string[] = [];
+    for await (const item of ws.iterHistory("p1", { actor: "you", limit: 2 }))
+      seen.push(item.id);
+    expect(seen).toEqual(["a", "b", "c"]);
+    const [first, second] = mockFetch.mock.calls.map(
+      ([input]) => new URL(String(input)),
+    );
+    expect(first.searchParams.has("cursor")).toBe(false);
+    expect(second.searchParams.get("cursor")).toBe("c2");
+    expect(second.searchParams.get("actor")).toBe("you");
+  });
+
+  it("iterHistory on an empty inventory yields nothing", async () => {
+    mockFetch.mockResolvedValue(
+      jsonResp(200, { items: [], next_cursor: null }),
+    );
+    const seen: unknown[] = [];
+    for await (const item of ws.iterHistory("p1")) seen.push(item);
+    expect(seen).toEqual([]);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 });

@@ -132,6 +132,27 @@ describe("enrich", () => {
     });
   });
 
+  it("carries attachment provenance into the submit", async () => {
+    const texts = [
+      {
+        text: "CVE-2000-0001",
+        source_artifact_id: "art-1",
+        filename: "notes.txt",
+      },
+    ];
+    mockFetch
+      .mockResolvedValueOnce(jsonResp(202, { enrichment_id: ID }))
+      .mockResolvedValueOnce(jsonResp(200, { status: "done", result: {} }));
+    await ws.enrich({
+      texts,
+      attachedArtifactIds: ["art-1"],
+      pollIntervalMs: 0,
+    });
+    expect(
+      JSON.parse((mockFetch.mock.calls[0][1] as RequestInit).body as string),
+    ).toEqual({ texts, attached_artifact_ids: ["art-1"] });
+  });
+
   it("carries the SSVC stakeholder into the submit", async () => {
     const stakeholder = {
       method: "deployer",
@@ -178,6 +199,36 @@ describe("enrich", () => {
     await expect(
       ws.enrich({ text: "x", pollIntervalMs: 0, timeoutMs: -1 }),
     ).rejects.toBeInstanceOf(RangeError);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("carries tlp into the submit and omits it when unset", async () => {
+    mockFetch
+      .mockResolvedValueOnce(jsonResp(202, { enrichment_id: ID }))
+      .mockResolvedValueOnce(jsonResp(200, { status: "done", result: {} }));
+    await ws.enrich({
+      text: "x",
+      formats: ["stix"],
+      tlp: "AMBER+STRICT",
+      pollIntervalMs: 0,
+    });
+    expect(
+      JSON.parse((mockFetch.mock.calls[0][1] as RequestInit).body as string),
+    ).toEqual({ text: "x", formats: ["stix"], tlp: "AMBER+STRICT" });
+
+    mockFetch
+      .mockResolvedValueOnce(jsonResp(202, { enrichment_id: ID }))
+      .mockResolvedValueOnce(jsonResp(200, { status: "done", result: {} }));
+    await ws.enrich({ text: "x", pollIntervalMs: 0 });
+    expect(
+      JSON.parse((mockFetch.mock.calls[2][1] as RequestInit).body as string),
+    ).toEqual({ text: "x" });
+  });
+
+  it("rejects an invalid tlp with RangeError before the billable submit", async () => {
+    await expect(
+      ws.enrich({ text: "x", tlp: "white" as never, pollIntervalMs: 0 }),
+    ).rejects.toThrow(RangeError);
     expect(mockFetch).not.toHaveBeenCalled();
   });
 });
@@ -262,5 +313,77 @@ describe("S11: enrich() with onProgress", () => {
     const body = JSON.parse((submit[1] as RequestInit).body as string);
     expect(body.text).toBe("CVE-2024-3400");
     expect(body.include).toEqual(["kev"]);
+  });
+});
+
+describe("enrichEvent", () => {
+  const ID = "e".repeat(32);
+
+  it("submits the raw event to /v1/event-enrich, polls until done, returns the result", async () => {
+    const result = {
+      event_id: "ev-1",
+      extracted_count: 2,
+      threat_assessment: { verdict: "critical" },
+    };
+    mockFetch
+      .mockResolvedValueOnce(
+        jsonResp(202, { enrichment_id: ID, status: "queued" }),
+      )
+      .mockResolvedValueOnce(jsonResp(200, { status: "done", result }));
+
+    const out = await ws.enrichEvent({
+      event: "CVE-2024-3400 beaconing to 185.220.101.5",
+      eventId: "ev-1",
+      pollIntervalMs: 0,
+    });
+    expect(out).toEqual({ enrichment_id: ID, result });
+
+    const submit = mockFetch.mock.calls[0];
+    expect(new URL(String(submit[0])).pathname).toBe("/v1/event-enrich");
+    const body = JSON.parse((submit[1] as RequestInit).body as string);
+    expect(body).toEqual({
+      event: "CVE-2024-3400 beaconing to 185.220.101.5",
+      event_id: "ev-1",
+    });
+    const polled = mockFetch.mock.calls[1][0];
+    expect(
+      new URL(polled instanceof Request ? polled.url : String(polled)).pathname,
+    ).toBe(`/v1/event-enrich/${ID}`);
+    expect(mockFetch).toHaveBeenCalledTimes(2); // no save POST
+  });
+
+  it("omits event_id when absent and streams onProgress", async () => {
+    mockFetch
+      .mockResolvedValueOnce(
+        jsonResp(202, { enrichment_id: ID, status: "queued" }),
+      )
+      .mockResolvedValueOnce(
+        jsonResp(200, { status: "running", progress: 0.5 }),
+      )
+      .mockResolvedValueOnce(jsonResp(200, { status: "done", result: {} }));
+
+    const seen: string[] = [];
+    await ws.enrichEvent({
+      event: "plain text",
+      pollIntervalMs: 0,
+      onProgress: (job) => seen.push(job.status as string),
+    });
+    expect(seen).toEqual(["running", "done"]);
+    const submit = mockFetch.mock.calls[0];
+    const body = JSON.parse((submit[1] as RequestInit).body as string);
+    expect(body).toEqual({ event: "plain text" });
+  });
+
+  it("raises UnexpectedStatus when the engine reports an error", async () => {
+    mockFetch
+      .mockResolvedValueOnce(
+        jsonResp(202, { enrichment_id: ID, status: "queued" }),
+      )
+      .mockResolvedValueOnce(
+        jsonResp(200, { status: "error", error: { error: "boom" } }),
+      );
+    await expect(
+      ws.enrichEvent({ event: "x", pollIntervalMs: 0 }),
+    ).rejects.toThrow(UnexpectedStatus);
   });
 });

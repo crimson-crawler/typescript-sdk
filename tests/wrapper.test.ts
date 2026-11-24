@@ -21,12 +21,14 @@ const mockEnrichProduct = vi.fn();
 const mockEnrichPackage = vi.fn();
 const mockSearchCti = vi.fn();
 
-// The 26 endpoints reached only by the full-surface parity methods. Hoisted as
+// The 30 endpoints reached only by the full-surface parity methods. Hoisted as
 // one object (like undiciAgentSpy below) so the factory can spread it wholesale
-// instead of repeating an arrow indirection 26 more times.
+// instead of repeating an arrow indirection 30 more times.
 const sdk = vi.hoisted(() => ({
   artifactEnrich: vi.fn(),
   artifactEnrichStatus: vi.fn(),
+  eventEnrich: vi.fn(),
+  eventEnrichStatus: vi.fn(),
   assessGroupExposure: vi.fn(),
   assessIocPortfolio: vi.fn(),
   assessTechniqueCoverage: vi.fn(),
@@ -35,8 +37,10 @@ const sdk = vi.hoisted(() => ({
   enrichBatch: vi.fn(),
   enrichCampaign: vi.fn(),
   enrichCapec: vi.fn(),
+  enrichCloak: vi.fn(),
   enrichDefend: vi.fn(),
   enrichDisarm: vi.fn(),
+  enrichF3: vi.fn(),
   enrichGroup: vi.fn(),
   enrichLocation: vi.fn(),
   enrichPocSource: vi.fn(),
@@ -44,6 +48,7 @@ const sdk = vi.hoisted(() => ({
   enrichSoftware: vi.fn(),
   inventoryEnrich: vi.fn(),
   inventoryEnrichStatus: vi.fn(),
+  searchCsaf: vi.fn(),
   searchCve: vi.fn(),
   searchD3Fend: vi.fn(),
   searchKev: vi.fn(),
@@ -118,12 +123,14 @@ const {
   ATLAS_FULL,
   CAMPAIGN_FULL,
   CAPEC_FULL,
+  CLOAK_FULL,
   CVE_FAST,
   CVE_FULL_WALK,
   CVE_NARRATIVE,
   CWE_FULL_WALK,
   DEFEND_FULL,
   DISARM_FULL,
+  F3_FULL,
   GROUP_FULL,
   IOC_FAST,
   IOC_FULL_WALK,
@@ -157,6 +164,12 @@ describe("module surface", () => {
     expect(__version__).toMatch(/^\d+\.\d+\.\d+/);
   });
 
+  it("defaults to permissive OSV and Android, not restricted advisories", () => {
+    expect(CVE_FULL_WALK).toContain("osv");
+    expect(CVE_FULL_WALK).toContain("android_bulletin");
+    expect(CVE_FULL_WALK).not.toContain("osv_restricted");
+  });
+
   it("exports non-empty preset arrays", () => {
     for (const preset of [
       CVE_FULL_WALK,
@@ -171,8 +184,10 @@ describe("module surface", () => {
       ATLAS_FULL,
       CAMPAIGN_FULL,
       CAPEC_FULL,
+      CLOAK_FULL,
       DEFEND_FULL,
       DISARM_FULL,
+      F3_FULL,
       GROUP_FULL,
       LOCATION_FULL,
       SECTOR_FULL,
@@ -564,6 +579,7 @@ describe("convenience methods", () => {
       client: client.api,
       body: { cve_id: "CVE-2024-3400", include: [...CVE_FULL_WALK] },
     });
+    expect(mockEnrichCve.mock.calls[0][0].body.include).toContain("cisa_kev");
   });
 
   it("enrichCveFull custom include overrides preset", async () => {
@@ -621,6 +637,20 @@ describe("convenience methods", () => {
     });
   });
 
+  it("enrichTechniqueFull looks a technique up from an ICS asset", async () => {
+    mockEnrichTechnique.mockResolvedValue(okData({}));
+    const client = new CrawlerClient();
+    await client.enrichTechniqueFull(undefined, "ics", TECHNIQUE_FULL, "A0002");
+    expect(mockEnrichTechnique).toHaveBeenCalledWith({
+      client: client.api,
+      body: {
+        asset_id: "A0002",
+        framework: "ics",
+        include: [...TECHNIQUE_FULL],
+      },
+    });
+  });
+
   it("enrichProductFull omits version + vendor by default", async () => {
     mockEnrichProduct.mockResolvedValue(okData({}));
     const client = new CrawlerClient();
@@ -642,6 +672,132 @@ describe("convenience methods", () => {
     const body = mockEnrichProduct.mock.calls[0]?.[0].body;
     expect(body.version).toBe("1.25");
     expect(body.vendor).toBe("nginx");
+  });
+
+  it("iterProductCves drains both pages", async () => {
+    mockEnrichProduct
+      .mockResolvedValueOnce(
+        okData({
+          snapshot_id: "a".repeat(32),
+          cves_next_offset: 5,
+          cves: [{ discovered_cve_id: "CVE-2024-0001" }],
+        }),
+      )
+      .mockResolvedValueOnce(
+        okData({
+          snapshot_id: "a".repeat(32),
+          cves_next_offset: null,
+          cves: [{ discovered_cve_id: "CVE-2024-0002" }],
+        }),
+      );
+    const client = new CrawlerClient();
+    const pages = [];
+    for await (const page of client.iterProductCves("nginx")) pages.push(page);
+    expect(
+      pages.flatMap(
+        (page) => page.cves?.map((cve) => cve.discovered_cve_id) ?? [],
+      ),
+    ).toEqual(["CVE-2024-0001", "CVE-2024-0002"]);
+  });
+
+  it("reconstructs shared product CVE context from the catalogue", async () => {
+    const fields = {
+      attack_patterns: { "CAPEC-1": { capec_id: "CAPEC-1", name: "pattern" } },
+      techniques: { T1000: { technique_id: "T1000", name: "technique" } },
+      mitigations: { M1000: { mitigation_id: "M1000", name: "mitigation" } },
+      weaknesses: { "CWE-1": { cwe_id: "CWE-1", name: "weakness" } },
+    };
+    const refs = {
+      attack_patterns: ["CAPEC-1"],
+      techniques: ["T1000"],
+      mitigations: ["M1000"],
+      weaknesses: ["CWE-1"],
+    };
+    mockEnrichProduct.mockResolvedValue(
+      okData({
+        product: "nginx",
+        cves: [
+          { cve: { cve_id: "CVE-2024-0001" }, catalog_refs: refs },
+          { cve: { cve_id: "CVE-2024-0002" }, catalog_refs: refs },
+        ],
+        cve_context_catalog: fields,
+      }),
+    );
+    const result = await new CrawlerClient().enrichProductFull("nginx");
+    for (const row of result.cves ?? []) {
+      expect(row.attack_patterns).toEqual([fields.attack_patterns["CAPEC-1"]]);
+      expect(row.techniques).toEqual([fields.techniques.T1000]);
+      expect(row.mitigations).toEqual([fields.mitigations.M1000]);
+      expect(row.weaknesses).toEqual([fields.weaknesses["CWE-1"]]);
+    }
+  });
+
+  it("reconstructs product CVE context returned by batch enrichment", async () => {
+    const technique = { technique_id: "T1000", name: "technique" };
+    sdk.enrichBatch.mockResolvedValue(
+      okData({
+        results: [
+          {
+            index: 0,
+            type: "product",
+            identifier: "nginx",
+            status: "ok",
+            data: {
+              product: "nginx",
+              cves: [
+                {
+                  cve: { cve_id: "CVE-2024-0001" },
+                  catalog_refs: { techniques: ["T1000"] },
+                },
+              ],
+              cve_context_catalog: { techniques: { T1000: technique } },
+            },
+          },
+        ],
+      }),
+    );
+    const response = await new CrawlerClient().enrichBatch([
+      { type: "product", product: "nginx" },
+    ]);
+    const data = response.results?.[0]?.data as {
+      cves: Array<{ techniques: unknown[] }>;
+    };
+    expect(data.cves[0]?.techniques).toEqual([technique]);
+  });
+
+  it("reconstructs group log sources returned by batch enrichment", async () => {
+    const source = { name: "Process Creation", channel: "Sysmon:1" };
+    sdk.enrichBatch.mockResolvedValue(
+      okData({
+        results: [
+          {
+            index: 0,
+            type: "group",
+            identifier: "G0001",
+            status: "ok",
+            data: {
+              group: {
+                group_id: "G0001",
+                techniques: [{ technique_id: "T1059", log_sources: [] }],
+              },
+              log_source_catalog: [source],
+              log_source_refs: { T1059: [0] },
+              techniques_next_offset: 10,
+              snapshot_id: "a".repeat(32),
+            },
+          },
+        ],
+      }),
+    );
+    const response = await new CrawlerClient().enrichBatch([
+      { type: "group", group_id: "G0001" },
+    ]);
+    const data = response.results?.[0]?.data as {
+      group: { techniques: Array<{ log_sources: unknown[] }> };
+      techniques_next_offset: number;
+    };
+    expect(data.group.techniques[0]?.log_sources).toEqual([source]);
+    expect(data.techniques_next_offset).toBe(10);
   });
 
   it("enrichPackageFull omits version by default + wires the preset", async () => {
@@ -667,6 +823,299 @@ describe("convenience methods", () => {
     expect(body.include).toEqual(["epss"]);
   });
 
+  it("streams a package page before reporting an unavailable continuation", async () => {
+    mockEnrichPackage
+      .mockResolvedValueOnce(
+        okData({
+          ecosystem: "PyPI",
+          package: "p",
+          snapshot_id: "a".repeat(32),
+          next_offset: 1,
+          advisories: [{ id: "GHSA-first" }],
+          errors: [],
+        }),
+      )
+      .mockResolvedValueOnce(
+        okData({
+          ecosystem: "PyPI",
+          package: "p",
+          snapshot_id: "a".repeat(32),
+          next_offset: null,
+          advisories: [],
+          errors: [
+            {
+              step: "get_vuln",
+              service: "osv",
+              error: "stored_copy_unavailable",
+            },
+          ],
+        }),
+      );
+    const pages = new CrawlerClient().iterPackageAdvisories("PyPI", "p");
+    const first = await pages.next();
+    expect(first.value?.advisories?.[0]?.id).toBe("GHSA-first");
+    expect(mockEnrichPackage).toHaveBeenCalledTimes(1);
+    await expect(pages.next()).rejects.toThrow("stored_copy_unavailable");
+  });
+
+  it("does not restart a package walk after the snapshot changes", async () => {
+    mockEnrichPackage
+      .mockResolvedValueOnce(
+        okData({ snapshot_id: "a".repeat(32), next_offset: 1, errors: [] }),
+      )
+      .mockResolvedValueOnce(
+        okData({ snapshot_id: "b".repeat(32), next_offset: null, errors: [] }),
+      );
+    const pages = new CrawlerClient().iterPackageAdvisories("PyPI", "p");
+    await pages.next();
+    await expect(pages.next()).rejects.toThrow("different snapshot");
+  });
+
+  describe("OSV advisory continuation", () => {
+    const snapshot = "d".repeat(32);
+    const osvPage = (
+      ids: string[],
+      next: number | null,
+      extra: Record<string, unknown> = {},
+    ) =>
+      okData({
+        osv_advisories: ids.map((id) => ({ id })),
+        osv_advisories_total: 4,
+        osv_advisories_truncated: next !== null,
+        ...(next !== null && {
+          osv_next_offset: next,
+          osv_snapshot_id: snapshot,
+        }),
+        errors: [],
+        ...extra,
+      });
+    const walks = [
+      {
+        name: "enrichCveFull",
+        mock: mockEnrichCve,
+        single: (c: CrawlerClient, offset?: number, id?: string) =>
+          c.enrichCveFull("CVE-2024-3400", ["osv_restricted"], {
+            osvOffset: offset,
+            osvSnapshotId: id,
+          }),
+        iterate: (c: CrawlerClient) =>
+          c.iterCveOsvPages("CVE-2024-3400", ["osv_restricted"]),
+        body: (rest: Record<string, unknown>) => ({
+          cve_id: "CVE-2024-3400",
+          include: ["osv_restricted"],
+          ...rest,
+        }),
+      },
+      {
+        name: "assessVulnerabilityExposure",
+        mock: sdk.assessVulnerabilityExposure,
+        single: (c: CrawlerClient, offset?: number, id?: string) =>
+          c.assessVulnerabilityExposure(["CVE-2024-3400"], {
+            include: ["osv_restricted"],
+            osvOffset: offset,
+            osvSnapshotId: id,
+          }),
+        iterate: (c: CrawlerClient) =>
+          c.iterVulnerabilityExposureOsvPages(["CVE-2024-3400"], {
+            include: ["osv_restricted"],
+          }),
+        body: (rest: Record<string, unknown>) => ({
+          cve_ids: ["CVE-2024-3400"],
+          include: ["osv_restricted"],
+          ...rest,
+        }),
+      },
+    ];
+
+    describe.each(walks)("$name", (walk) => {
+      beforeEach(() => walk.mock.mockReset());
+
+      it("sends the cursor fields only when given", async () => {
+        walk.mock.mockResolvedValue(okData({}));
+        const client = new CrawlerClient();
+        await walk.single(client);
+        await walk.single(client, 7, snapshot);
+        expect(walk.mock.mock.calls[0][0].body).toEqual(walk.body({}));
+        expect(walk.mock.mock.calls[1][0].body).toEqual(
+          walk.body({ osv_offset: 7, osv_snapshot_id: snapshot }),
+        );
+      });
+
+      it("streams lazily and follows the cursor, including page-zero offset 0", async () => {
+        walk.mock
+          .mockResolvedValueOnce(osvPage(["GHSA-1"], 0))
+          .mockResolvedValueOnce(osvPage(["GHSA-2"], 3))
+          .mockResolvedValueOnce(osvPage(["GHSA-3", "GHSA-4"], null));
+        const pages = walk.iterate(new CrawlerClient());
+        const first = await pages.next();
+        expect(first.value?.osv_advisories?.[0]?.id).toBe("GHSA-1");
+        expect(walk.mock).toHaveBeenCalledTimes(1);
+        const rest = [];
+        for await (const page of pages) rest.push(page);
+        expect(rest).toHaveLength(2);
+        expect(
+          walk.mock.mock.calls.map(([arg]) => [
+            arg.body.osv_offset,
+            arg.body.osv_snapshot_id,
+          ]),
+        ).toEqual([
+          [0, undefined],
+          [0, snapshot],
+          [3, snapshot],
+        ]);
+        // The licence opt-in is replayed verbatim on every continuation.
+        for (const [arg] of walk.mock.mock.calls) {
+          expect(arg.body.include).toEqual(["osv_restricted"]);
+        }
+      });
+
+      it("does not restart after the snapshot expires", async () => {
+        walk.mock
+          .mockResolvedValueOnce(osvPage(["GHSA-1"], 1))
+          .mockResolvedValueOnce(
+            errData(409, { detail: { error: "snapshot_expired" } }),
+          );
+        const pages = walk.iterate(new CrawlerClient());
+        await pages.next();
+        await expect(pages.next()).rejects.toMatchObject({
+          name: "UnexpectedStatus",
+          status: 409,
+        });
+        expect(walk.mock).toHaveBeenCalledTimes(2);
+      });
+
+      it("surfaces an unavailable snapshot store", async () => {
+        walk.mock
+          .mockResolvedValueOnce(osvPage(["GHSA-1"], 1))
+          .mockResolvedValueOnce(
+            errData(503, { detail: { error: "snapshot_unavailable" } }),
+          );
+        const pages = walk.iterate(new CrawlerClient());
+        await pages.next();
+        await expect(pages.next()).rejects.toMatchObject({ status: 503 });
+      });
+
+      it.each([
+        ["no progress", { osv_next_offset: 1, osv_snapshot_id: snapshot }],
+        [
+          "snapshot change",
+          { osv_next_offset: 5, osv_snapshot_id: "e".repeat(32) },
+        ],
+      ])("rejects a continuation with %s", async (_label, extra) => {
+        walk.mock
+          .mockResolvedValueOnce(osvPage(["GHSA-1"], 1))
+          .mockResolvedValueOnce(
+            okData({ osv_advisories: [], errors: [], ...extra }),
+          );
+        const pages = walk.iterate(new CrawlerClient());
+        await pages.next();
+        await expect(pages.next()).rejects.toThrow("OSV");
+      });
+
+      it("rejects a cursor without a snapshot", async () => {
+        walk.mock.mockResolvedValueOnce(
+          okData({ osv_advisories: [], osv_next_offset: 2, errors: [] }),
+        );
+        await expect(walk.iterate(new CrawlerClient()).next()).rejects.toThrow(
+          "OSV",
+        );
+      });
+
+      it("reports store loss on a continuation", async () => {
+        walk.mock
+          .mockResolvedValueOnce(osvPage(["GHSA-1"], 1))
+          .mockResolvedValueOnce(
+            okData({
+              osv_advisories: [],
+              errors: [
+                {
+                  step: "get_vuln",
+                  service: "osv",
+                  error: "stored_copy_unavailable",
+                },
+              ],
+            }),
+          );
+        const pages = walk.iterate(new CrawlerClient());
+        await pages.next();
+        await expect(pages.next()).rejects.toThrow("stored_copy_unavailable");
+      });
+
+      it("yields one page when there is no OSV cursor", async () => {
+        walk.mock.mockResolvedValueOnce(okData({ errors: [] }));
+        const rest = [];
+        for await (const page of walk.iterate(new CrawlerClient()))
+          rest.push(page);
+        expect(rest).toHaveLength(1);
+        expect(walk.mock).toHaveBeenCalledTimes(1);
+      });
+
+      it("accepts a terminal page that omits both cursor fields", async () => {
+        walk.mock
+          .mockResolvedValueOnce(osvPage(["GHSA-1"], 1))
+          .mockResolvedValueOnce(
+            okData({
+              osv_advisories: [{ id: "GHSA-2" }],
+              osv_advisories_total: 4,
+              errors: [],
+            }),
+          );
+        const rest = [];
+        for await (const page of walk.iterate(new CrawlerClient()))
+          rest.push(page);
+        expect(rest).toHaveLength(2);
+        expect(walk.mock).toHaveBeenCalledTimes(2);
+      });
+
+      it("still rejects a terminal page carrying a different snapshot id", async () => {
+        walk.mock
+          .mockResolvedValueOnce(osvPage(["GHSA-1"], 1))
+          .mockResolvedValueOnce(
+            okData({
+              osv_advisories: [],
+              osv_snapshot_id: "e".repeat(32),
+              errors: [],
+            }),
+          );
+        const pages = walk.iterate(new CrawlerClient());
+        await pages.next();
+        await expect(pages.next()).rejects.toThrow("OSV");
+      });
+    });
+  });
+
+  it.each(["group", "exposure"])(
+    "expands %s catalogue references",
+    async (kind) => {
+      const source = { name: "eventlog", channel: "security" };
+      const technique = { technique_id: "T0001", log_sources: [] };
+      const common = {
+        log_source_catalog: [source],
+        log_source_refs: { T0001: [0, 0] },
+      };
+      const client = new CrawlerClient();
+      if (kind === "group") {
+        sdk.enrichGroup.mockResolvedValue(
+          okData({
+            ...common,
+            group: { group_id: "G0001", techniques: [technique] },
+          }),
+        );
+        const page = await client.enrichGroupFull("G0001");
+        const row = page.group?.techniques?.[0];
+        expect(typeof row === "string" ? [] : row?.log_sources).toEqual([
+          source,
+          source,
+        ]);
+      } else {
+        sdk.assessGroupExposure.mockResolvedValue(
+          okData({ ...common, techniques: [technique] }),
+        );
+        const page = await client.assessGroupExposure({ groupIds: ["G0001"] });
+        expect(page.techniques?.[0]?.log_sources).toEqual([source, source]);
+      }
+    },
+  );
   it("ensureOk uses status 0 when response missing", async () => {
     mockEnrichIoc.mockResolvedValue({ data: undefined, error: "boom" });
     const client = new CrawlerClient();
@@ -703,7 +1152,7 @@ describe("convenience methods", () => {
 });
 
 // --------------------------------------------------------------------------- //
-// Full-surface parity: the 27 methods that complete 33/33 operation coverage
+// Full-surface parity: the methods that complete 37/37 operation coverage
 // --------------------------------------------------------------------------- //
 //
 // One row per method. Each asserts the three things the wrapper alone is
@@ -747,6 +1196,12 @@ const PARITY_CASES: readonly ParityCase[] = [
     { body: { capec_id: "CAPEC-66", include: [...CAPEC_FULL] } },
   ],
   [
+    "enrichCloakFull",
+    sdk.enrichCloak,
+    (c) => c.enrichCloakFull("TTP-496"),
+    { body: { cloak_id: "TTP-496", include: [...CLOAK_FULL] } },
+  ],
+  [
     "enrichDefendFull",
     sdk.enrichDefend,
     (c) => c.enrichDefendFull("D3-NTA"),
@@ -757,6 +1212,12 @@ const PARITY_CASES: readonly ParityCase[] = [
     sdk.enrichDisarm,
     (c) => c.enrichDisarmFull("T0086"),
     { body: { technique_id: "T0086", include: [...DISARM_FULL] } },
+  ],
+  [
+    "enrichF3Full",
+    sdk.enrichF3,
+    (c) => c.enrichF3Full("F1031"),
+    { body: { f3_id: "F1031", include: [...F3_FULL] } },
   ],
   [
     "enrichGroupFull",
@@ -849,10 +1310,45 @@ const PARITY_CASES: readonly ParityCase[] = [
     { body: { query: "network traffic analysis", limit: 20, page: 1 } },
   ],
   [
+    "searchD3fend include",
+    sdk.searchD3Fend,
+    (c) =>
+      c.searchD3fend("network traffic analysis", { include: ["versions"] }),
+    {
+      body: {
+        query: "network traffic analysis",
+        limit: 20,
+        page: 1,
+        include: ["versions"],
+      },
+    },
+  ],
+  [
+    "searchCsaf",
+    sdk.searchCsaf,
+    (c) =>
+      c.searchCsaf({ publisher: "Siemens", sector: "Water and Wastewater" }),
+    {
+      body: {
+        publisher: "Siemens",
+        sector: "Water and Wastewater",
+        sort: "newest",
+        limit: 20,
+        page: 1,
+      },
+    },
+  ],
+  [
     "searchKev",
     sdk.searchKev,
     (c) => c.searchKev({ cveId: "CVE-2000-0001" }),
     { body: { cve_id: "CVE-2000-0001", limit: 50, page: 1 } },
+  ],
+  [
+    "searchKev include",
+    sdk.searchKev,
+    (c) => c.searchKev({ include: ["statistics"] }),
+    { body: { limit: 50, page: 1, include: ["statistics"] } },
   ],
   [
     "searchKnowledgebase",
@@ -885,6 +1381,21 @@ const PARITY_CASES: readonly ParityCase[] = [
     { body: { text: "incident notes" } },
   ],
   [
+    "artifactEnrich attachment provenance",
+    sdk.artifactEnrich,
+    (c) =>
+      c.artifactEnrich({
+        texts: [{ text: "CVE-2000-0001", source_artifact_id: "art-1" }],
+        attachedArtifactIds: ["art-1"],
+      }),
+    {
+      body: {
+        texts: [{ text: "CVE-2000-0001", source_artifact_id: "art-1" }],
+        attached_artifact_ids: ["art-1"],
+      },
+    },
+  ],
+  [
     "artifactEnrichStatus",
     sdk.artifactEnrichStatus,
     (c) => c.artifactEnrichStatus(ENRICHMENT_ID),
@@ -897,9 +1408,49 @@ const PARITY_CASES: readonly ParityCase[] = [
     { body: { items: [{ product: "nginx" }] } },
   ],
   [
+    "inventoryEnrich attachment provenance",
+    sdk.inventoryEnrich,
+    (c) =>
+      c.inventoryEnrich([{ product: "nginx" }], {
+        attachmentsTexts: [
+          { text: "CVE-2000-0001", source_artifact_id: "art-1" },
+        ],
+        attachedArtifactIds: ["art-1"],
+      }),
+    {
+      body: {
+        items: [{ product: "nginx" }],
+        attachments_texts: [
+          { text: "CVE-2000-0001", source_artifact_id: "art-1" },
+        ],
+        attached_artifact_ids: ["art-1"],
+      },
+    },
+  ],
+  [
     "inventoryEnrichStatus",
     sdk.inventoryEnrichStatus,
     (c) => c.inventoryEnrichStatus(ENRICHMENT_ID),
+    { path: { enrichment_id: ENRICHMENT_ID } },
+  ],
+  [
+    "eventEnrich",
+    sdk.eventEnrich,
+    (c) =>
+      c.eventEnrich('{"alertId":"a1","cve":"CVE-2000-0001"}', {
+        eventId: "ev-1",
+      }),
+    {
+      body: {
+        event: '{"alertId":"a1","cve":"CVE-2000-0001"}',
+        event_id: "ev-1",
+      },
+    },
+  ],
+  [
+    "eventEnrichStatus",
+    sdk.eventEnrichStatus,
+    (c) => c.eventEnrichStatus(ENRICHMENT_ID),
     { path: { enrichment_id: ENRICHMENT_ID } },
   ],
 ];
@@ -925,6 +1476,12 @@ const PRESET_METHODS = [
       c.enrichCapecFull("CAPEC-66", { include: i }),
   ],
   [
+    "enrichCloakFull",
+    sdk.enrichCloak,
+    (c: CrawlerClient, i: string[]) =>
+      c.enrichCloakFull("TTP-496", { include: i }),
+  ],
+  [
     "enrichDefendFull",
     sdk.enrichDefend,
     (c: CrawlerClient, i: string[]) =>
@@ -935,6 +1492,11 @@ const PRESET_METHODS = [
     sdk.enrichDisarm,
     (c: CrawlerClient, i: string[]) =>
       c.enrichDisarmFull("T0086", { include: i }),
+  ],
+  [
+    "enrichF3Full",
+    sdk.enrichF3,
+    (c: CrawlerClient, i: string[]) => c.enrichF3Full("F1031", { include: i }),
   ],
   [
     "enrichGroupFull",
@@ -1020,6 +1582,26 @@ describe("full-surface parity methods", () => {
     expect(body.include).toEqual([...ATLAS_FULL]);
   });
 
+  it("enrichF3Full sends only the search keyword and keeps the preset", async () => {
+    sdk.enrichF3.mockResolvedValue(okData({}));
+    const client = new CrawlerClient();
+    await client.enrichF3Full(undefined, { search: "money mule" });
+    const body = sdk.enrichF3.mock.calls[0]?.[0].body;
+    expect(body).not.toHaveProperty("f3_id");
+    expect(body.search).toBe("money mule");
+    expect(body.include).toEqual([...F3_FULL]);
+  });
+
+  it("enrichCloakFull sends only the search keyword and keeps the preset", async () => {
+    sdk.enrichCloak.mockResolvedValue(okData({}));
+    const client = new CrawlerClient();
+    await client.enrichCloakFull(undefined, { search: "obfuscated dns" });
+    const body = sdk.enrichCloak.mock.calls[0]?.[0].body;
+    expect(body).not.toHaveProperty("cloak_id");
+    expect(body.search).toBe("obfuscated dns");
+    expect(body.include).toEqual([...CLOAK_FULL]);
+  });
+
   it("framework defaults to enterprise and is overridable", async () => {
     sdk.enrichGroup.mockResolvedValue(okData({}));
     const client = new CrawlerClient();
@@ -1098,6 +1680,7 @@ describe("full-surface parity methods", () => {
       published: true,
       dateFrom: "2024-01-01",
       dateTo: "2024-02-01",
+      include: ["sightings"],
       limit: 5,
       page: 3,
     });
@@ -1113,9 +1696,21 @@ describe("full-surface parity methods", () => {
       published: true,
       date_from: "2024-01-01",
       date_to: "2024-02-01",
+      include: ["sightings"],
       limit: 5,
       page: 3,
     });
+  });
+
+  it("an omitted searchMisp include is absent from the wire body", async () => {
+    // The sightings opt-in is the only accepted value; leaving it out must not
+    // put an empty array on the wire, or every search pays the upstream work.
+    sdk.searchMisp.mockResolvedValue(okData({}));
+    const client = new CrawlerClient();
+    await client.searchMisp({ value: "8.8.8.8" });
+    const body = sdk.searchMisp.mock.calls[0]?.[0].body;
+    expect(body).not.toHaveProperty("include");
+    expect(body).toEqual({ value: "8.8.8.8", limit: 50, page: 1 });
   });
 
   it("an omitted filter is absent, while paging defaults are materialized", async () => {
@@ -1129,6 +1724,7 @@ describe("full-surface parity methods", () => {
     expect(body).toEqual({ limit: 50, page: 1 });
     expect(body).not.toHaveProperty("cve_id");
     expect(body).not.toHaveProperty("ransomware_status");
+    expect(body).not.toHaveProperty("include");
   });
 
   it("assess methods pass include through without a preset", async () => {
@@ -1147,17 +1743,18 @@ describe("full-surface parity methods", () => {
 });
 
 describe("full-walk preset contents", () => {
-  // `summary` costs an LLM generation and `web_scrape` a live external fetch.
-  // No full-walk preset opts into either — CVE_NARRATIVE is the one preset that
+  // `summary` costs an LLM generation. No full-walk preset opts into it — CVE_NARRATIVE is the one preset that
   // asks for `summary`, and it does so explicitly.
   it.each([
     ["ATLAS_FULL", ATLAS_FULL],
     ["CAMPAIGN_FULL", CAMPAIGN_FULL],
     ["CAPEC_FULL", CAPEC_FULL],
+    ["CLOAK_FULL", CLOAK_FULL],
     ["CVE_FULL_WALK", CVE_FULL_WALK],
     ["CWE_FULL_WALK", CWE_FULL_WALK],
     ["DEFEND_FULL", DEFEND_FULL],
     ["DISARM_FULL", DISARM_FULL],
+    ["F3_FULL", F3_FULL],
     ["GROUP_FULL", GROUP_FULL],
     ["IOC_FULL_WALK", IOC_FULL_WALK],
     ["LOCATION_FULL", LOCATION_FULL],
@@ -1165,10 +1762,9 @@ describe("full-walk preset contents", () => {
     ["PRODUCT_FULL", PRODUCT_FULL],
     ["SECTOR_FULL", SECTOR_FULL],
     ["SOFTWARE_FULL", SOFTWARE_FULL],
-  ])("%s holds no duplicates and no LLM/scrape layer", (_name, preset) => {
+  ])("%s holds no duplicates and no LLM layer", (_name, preset) => {
     expect(new Set(preset).size).toBe(preset.length);
     expect(preset).not.toContain("summary");
-    expect(preset).not.toContain("web_scrape");
   });
 
   it("CVE_NARRATIVE is the deliberate exception that opts into summary", () => {

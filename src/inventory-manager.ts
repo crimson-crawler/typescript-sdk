@@ -15,6 +15,7 @@
 import { ProgressCallback, pollUntilDone, validatePollOptions } from "./_poll";
 import { UnexpectedStatus } from "./exceptions";
 import { ingestScan as runIngestScan } from "./ingest";
+import { type Tlp, validateTlp } from "./tlp";
 import { pathSegment } from "./url";
 
 /** A fetch-like function — the CrawlerClient hands in its retry/timeout wrapper. */
@@ -51,10 +52,13 @@ function wireSources(
 export interface InventoryOptions {
   description?: string;
   /** Asset inventory — each `{ product, vendor?, versions?, ecosystem?, category?, criticality?,
-   *  notes?, exposure?, environment?, owner?, tags? }`. */
+   *  notes?, exposure?, environment?, owner?, tags? }`, optionally plus its OT context
+   *  `{ asset_class?, purdue_level?, protocols?, firmware_version?, hardware_version?, safety_critical? }`
+   *  (all caller-supplied, never inferred). */
   items?: Array<Record<string, unknown>>;
   monitoring?: boolean;
-  /** Attached reference-artifact ids (the inventory's context window). */
+  /** Attached reference-artifact ids (the inventory's context window). Each NEWLY attached artifact takes
+   *  the inventory's own TLP 2.0 marking. */
   linkedArtifactIds?: string[];
 }
 
@@ -62,6 +66,72 @@ export interface InventoryOptions {
 export interface AttachmentOmission {
   attachment_id: string;
   reason: string;
+}
+
+/** Filters for `getHistory` / `iterHistory`. Unset fields are omitted so the server applies its defaults. */
+export interface HistoryOptions {
+  /** Event types to keep (`assets_changed`, `renamed`, `enrichment_saved`, …): a list or a comma string. */
+  types?: string[] | string;
+  /** Search text matched against each event summary. */
+  q?: string;
+  /** ISO date lower bound. */
+  since?: string;
+  /** ISO date upper bound. */
+  until?: string;
+  /** Who acted: `you`, `daily monitor` or `api`. */
+  actor?: string;
+  /** Page size, 1–200 (server default 50). */
+  limit?: number;
+  /** Opaque cursor from a previous page's `next_cursor`. */
+  cursor?: string;
+}
+
+/** One change-history row. `ref` names the artifact, report or enrichment it points at. */
+export interface HistoryItem {
+  id: string;
+  type: string;
+  at: string;
+  actor: "you" | "daily monitor" | "api";
+  surface: "web" | "api" | "mcp" | "monitor";
+  summary: string;
+  detail: Record<string, unknown> | null;
+  ref: { kind: string; id: string; name: string; deleted: boolean } | null;
+}
+
+/** One page of change history. */
+export interface HistoryPage {
+  items: HistoryItem[];
+  next_cursor: string | null;
+}
+
+/** Query string for `GET …/history`: a list of types becomes a comma string; undefined fields are dropped. */
+function historyParams(opts: HistoryOptions): Record<string, string> {
+  const types = Array.isArray(opts.types) ? opts.types.join(",") : opts.types;
+  const raw: Record<string, string | number | undefined> = {
+    type: types,
+    q: opts.q,
+    since: opts.since,
+    until: opts.until,
+    actor: opts.actor,
+    limit: opts.limit,
+    cursor: opts.cursor,
+  };
+  const params: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw))
+    if (v !== undefined) params[k] = String(v);
+  return params;
+}
+
+/** The inventory manifest's attached VEX overlay document text (`vex_overlay.document` from
+ *  `GET /inventory-manager/inventories/{id}`), or `undefined` when no overlay is attached. */
+function manifestVexOverlay(
+  manifest: Record<string, unknown>,
+): string | undefined {
+  const overlay = manifest.vex_overlay;
+  if (!overlay || typeof overlay !== "object" || !("document" in overlay))
+    return undefined;
+  const doc = overlay.document;
+  return typeof doc === "string" && doc.trim() ? doc : undefined;
 }
 
 /** Build the create/update-inventory body — inventory_name required; other fields ride only when provided. */
@@ -217,13 +287,44 @@ export class InventoryManagerApi {
   }
 
   /**
+   * One page of an inventory's change history, newest first. Covers asset, attachment, TLP, rename,
+   * settings and VEX changes, saved enrichments and generated reports. Exports and Copy for AI are
+   * not logged. Pass `cursor` from a previous page's `next_cursor` to continue.
+   */
+  async getHistory(
+    inventoryId: string,
+    opts: HistoryOptions = {},
+  ): Promise<HistoryPage> {
+    const resp = await this.request(
+      "GET",
+      `/inventory-manager/inventories/${pathSegment(inventoryId)}/history`,
+      { params: historyParams(opts) },
+    );
+    return (await resp.json()) as HistoryPage;
+  }
+
+  /** Yield every history item newest first, following `next_cursor` across pages until exhausted. */
+  async *iterHistory(
+    inventoryId: string,
+    opts: Omit<HistoryOptions, "cursor"> = {},
+  ): AsyncGenerator<HistoryItem> {
+    let cursor: string | undefined;
+    do {
+      const page = await this.getHistory(inventoryId, { ...opts, cursor });
+      yield* page.items;
+      cursor = page.next_cursor ?? undefined;
+    } while (cursor);
+  }
+
+  /**
    * Create an Inventory Manager inventory (a continuously-monitored context window).
    *
    * @param inventoryName The inventory's display name.
    * @param options `description`, `items` (asset inventory — each `{ product, vendor?, versions?,
    *   ecosystem?, category?, criticality?, notes? }`), `monitoring` (always full depth — no fast/lite
-   *   mode), `linkedArtifactIds`.
-   * @returns `{ id, item_count }`.
+   *   mode), `linkedArtifactIds` (each takes the new inventory's own TLP 2.0 marking).
+   * @returns `{ id, item_count }`, plus `attachment_tlp` / `attachment_tlp_ids` when
+   *   `linkedArtifactIds` were passed (the marking carried onto them).
    */
   async createInventory(
     inventoryName: string,
@@ -239,7 +340,10 @@ export class InventoryManagerApi {
    * Update an inventory's definition (name, description, inventory, monitoring, attachments).
    * This is a **partial merge** (PATCH): only the fields you pass change — omitted fields are PRESERVED,
    * including the asset-group metadata and daily-report config this method doesn't expose. `inventoryName`
-   * is still required by the API. Resolves `{ id, item_count }`.
+   * is still required by the API. Any artifact newly added through `linkedArtifactIds` takes the
+   * inventory's own TLP 2.0 marking (already-attached artifacts are left alone). Resolves
+   * `{ id, item_count }`, plus `attachment_tlp` / `attachment_tlp_ids` (the marking carried onto newly
+   * attached artifacts).
    */
   async updateInventory(
     inventoryId: string,
@@ -258,10 +362,14 @@ export class InventoryManagerApi {
    *
    * @param options `format` — one of `json` (asset JSON), `sbom` (CycloneDX / SPDX SBOM), `csv`,
    *   `nmap` (nmap `-sV` XML), `list` (CPE / purl list), `grype`, `trivy` (SCA JSON), `depcheck`
-   *   (OWASP Dependency-Check JSON), `nessus` (`.nessus` XML), `gvm` (OpenVAS / Greenbone XML);
-   *   `content` — the file's text; optional `inventoryName` / `description` (override
-   *   anything the file carries).
-   * @returns `{ id, item_count, imported, format, truncated? }`.
+   *   (OWASP Dependency-Check JSON), `nessus` (`.nessus` XML), `gvm` (OpenVAS / Greenbone XML),
+   *   `vex` (a VEX suppression overlay — OpenVEX 0.2.0 / CSAF 2.0 VEX JSON; attaches to the
+   *   inventory named by `inventoryId`, or creates a bare inventory holding it — imports NO assets);
+   *   `content` — the file's text (or `Uint8Array` for the binary `xlsx`); optional
+   *   `inventoryName` / `description` (override anything the file carries).
+   * @returns `{ id, item_count, imported, format, truncated?, dropped? }` — `dropped` (SBOM imports
+   *   only) counts dependency edges the parser could not retain (#334). `format:'vex'` returns
+   *   `{ id, imported:0, format:'vex', statements }` instead.
    */
   async importInventory(options: {
     format: string;
@@ -302,7 +410,7 @@ export class InventoryManagerApi {
    *   override. A binary `xlsx` source can't be sniffed, so it needs `format: "xlsx"` + `Uint8Array` content
    *   (base64-encoded on the wire). A source that fails to parse is ISOLATED (it appears in `per_source` with
    *   its `error`, contributing nothing — never failing the whole call).
-   * @returns `{ items, count, asset_groups, truncated?, per_source: [{ label, contributed, truncated?, error? }] }`.
+   * @returns `{ items, count, asset_groups, truncated?, dropped?, per_source: [{ label, contributed, truncated?, dropped?, error? }] }`.
    */
   async parseMulti(
     sources: Array<{
@@ -394,17 +502,22 @@ export class InventoryManagerApi {
    * Apply a recommended upgrade — set the matched asset's version to the published fix the Inventory
    * Enricher surfaced (`recommended_fix_version` / `recommended_fix_version_kev`), PRESERVING everything
    * else on the inventory. Match is by `product` (case-insensitive; `vendor` disambiguates duplicate
-   * product names). Writes the inventory only — it does NOT re-enrich (the next enrichment / daily monitor
-   * confirms the CVEs cleared). Resolves `{ id, product, version, item_count }` (404 when no asset matches).
+   * product names). This rewrites **every** asset carrying that product — pass `group` to scope the fix
+   * to one host/asset group (`group` is the asset's own grouping, which host-derived imports set per
+   * host). Writes the inventory only — it does NOT re-enrich (the next enrichment / daily monitor
+   * confirms the CVEs cleared). Resolves `{ id, product, version, applied, item_count }` (404 when no
+   * asset matches, or none matches within `group`).
    */
   async applyAssetFix(
     inventoryId: string,
     product: string,
     version: string,
     vendor?: string,
+    group?: string,
   ): Promise<Record<string, unknown>> {
     const json: Record<string, unknown> = { product, version };
     if (vendor !== undefined) json.vendor = vendor;
+    if (group !== undefined) json.group = group;
     const resp = await this.request(
       "PATCH",
       `/inventory-manager/inventories/${pathSegment(inventoryId)}/asset-version`,
@@ -432,18 +545,26 @@ export class InventoryManagerApi {
    *
    * @param inventoryId The inventory id.
    * @param format `json` / `csv` / `list` (CPE/purl) / `cyclonedx` / `spdx` (3.0.1) / `spdx2` (SPDX 2.3)
-   *   / `workbook` (binary Excel .xlsx). `json` / `csv` / `list` round-trip back through
-   *   {@link importInventory}. Defaults to `json`.
+   *   / `workbook` (binary Excel .xlsx) / `all` (.zip of every format). `json` / `csv` / `list` round-trip
+   *   back through {@link importInventory}. Defaults to `json`.
+   * @param options.tlp The TLP 2.0 marking written into the asset-inventory formats that have a slot
+   *   (`cyclonedx` / `spdx` / `spdx2` / `workbook`; `CLEAR` / `GREEN` / `AMBER` / `AMBER+STRICT` / `RED`),
+   *   overriding the inventory's stored TLP; omit it to stamp the inventory's own stored TLP.
+   *   `json` / `csv` / `list` have no marking slot and ignore it. An invalid value
+   *   throws a `RangeError` before any request.
    */
   async exportInventory(
     inventoryId: string,
     format = "json",
+    options: { tlp?: Tlp } = {},
   ): Promise<string | Uint8Array> {
+    const tlp = validateTlp(options.tlp);
     const resp = await this.request(
       "GET",
       `/inventory-manager/inventories/${pathSegment(inventoryId)}/export/${pathSegment(format)}`,
+      tlp === undefined ? {} : { params: { tlp } },
     );
-    return format === "workbook"
+    return format === "workbook" || format === "all"
       ? new Uint8Array(await resp.arrayBuffer())
       : await resp.text();
   }
@@ -457,7 +578,9 @@ export class InventoryManagerApi {
     return Boolean(((await resp.json()) as { deleted?: boolean }).deleted);
   }
 
-  /** Link an existing artifact to an inventory. Resolves to `{ ok, linked, already }`. */
+  /** Link an existing artifact to an inventory. The newly attached artifact takes the INVENTORY's own
+   *  TLP 2.0 marking (it can raise or lower the artifact's marking). Resolves to
+   *  `{ ok, linked, already, attachment_tlp, attachment_tlp_ids }`. */
   async attachToInventory(
     inventoryId: string,
     artifactId: string,
@@ -491,7 +614,8 @@ export class InventoryManagerApi {
    * REPLACE an inventory's attached reference artifacts in one call (the bulk twin of
    * {@link attachToInventory}), PRESERVING its inventory / monitoring / alert-prefs. Only attachable
    * kinds (`input` / `enrichment` / `report`) are kept; inventories and inventory enrichments are skipped. Deduped +
-   * capped at 100. Resolves `{ id, linked_count, attached, skipped, mode }`.
+   * capped at 100. Each newly attached artifact takes the inventory's own TLP 2.0 marking. Resolves
+   * `{ id, linked_count, attached, skipped, mode, attachment_tlp, attachment_tlp_ids }`.
    */
   async setAttachments(
     inventoryId: string,
@@ -508,7 +632,8 @@ export class InventoryManagerApi {
   }
 
   /** APPEND several artifacts to an inventory's attachments in one call (bulk {@link attachToInventory});
-   *  same filtering/cap/return as {@link setAttachments}. */
+   *  same filtering/cap/return as {@link setAttachments} — including the re-marking of the newly attached
+   *  artifacts to the inventory's own TLP 2.0 marking. */
   async addAttachments(
     inventoryId: string,
     artifactIds: string[],
@@ -607,7 +732,14 @@ export class InventoryManagerApi {
    * The enrichment submit is enrichment compute and **counts toward your usage** (it rides your key to
    * `/v1/inventory-enrich`); reading the inventory and polling do not.
    *
-   * Resolves to `{ enrichment_id, report }`. If the inventory's inventory is empty this short-circuits and
+   * The inventory's attached **VEX suppression overlay** (imported with `format: 'vex'`) always rides along
+   * as the engine's `vex_overlay`, so findings the VEX marks `not_affected`/`fixed` come back
+   * `suppressed_by_vex` (retained + justification, excluded from the actionable counts) instead of being
+   * re-reported. Nothing to pass — it is read from the inventory manifest.
+   *
+   * Resolves to `{ enrichment_id, report }`; `report` is the InventoryEnrichmentResult (per-asset CVEs with
+   * CVSS vectors, EPSS percentile, NIST LEV (`lev`), KEV detail, Metasploit / Nuclei, `provenance`; plus `technique_catalog` and
+   * `mitigation_catalog`). If the inventory's inventory is empty this short-circuits and
    * resolves to `{ enrichment_id: null, empty: true }` without submitting. Throws `UnexpectedStatus` on a
    * non-2xx (or enrichment error), or `Error` if the enrichment doesn't finish within `timeoutMs`.
    */
@@ -645,9 +777,18 @@ export class InventoryManagerApi {
     if (items.length === 0) return { enrichment_id: null, empty: true };
     const doAttach =
       options.enrichAttachments ?? manifest.enrich_attachments === true;
-    let attachmentsText: string | undefined;
+    let attachmentsTexts: Array<{
+      text: string;
+      source_artifact_id: string;
+      filename: string;
+    }> = [];
     let attachmentsFiles:
-      Array<{ filename: string; content_b64: string }> | undefined;
+      | Array<{
+          filename: string;
+          content_b64: string;
+          source_artifact_id: string;
+        }>
+      | undefined;
     let attachmentOmissions: AttachmentOmission[] = [];
     if (doAttach) {
       const ids = (
@@ -658,7 +799,7 @@ export class InventoryManagerApi {
         .map((a) => a?.id)
         .filter((x): x is string => typeof x === "string");
       const resolved = await this.resolveAttachments(ids);
-      attachmentsText = resolved.text;
+      attachmentsTexts = resolved.texts;
       if (resolved.files.length) attachmentsFiles = resolved.files;
       attachmentOmissions = resolved.omissions;
       if (options.strictAttachments && attachmentOmissions.length) {
@@ -671,8 +812,9 @@ export class InventoryManagerApi {
     }
     const result = await this.enrichItems(items, {
       ...options,
-      attachmentsText,
+      attachmentsTexts,
       attachmentsFiles,
+      vexOverlay: manifestVexOverlay(manifest),
     });
     if (doAttach) result.attachment_omissions = attachmentOmissions;
     if (options.save && result.enrichment_id) {
@@ -684,16 +826,36 @@ export class InventoryManagerApi {
     return result;
   }
 
-  /** Fetch the inventory's attached artifacts (≤20) and split them for the engine. Resolution is
-   *  permissive: every skipped attachment is returned in `omissions`; callers that need complete
-   *  evidence should use `enrichInventory({ strictAttachments: true })`. */
+  /** Fetch the inventory's attached artifacts (≤20) and split them for the engine: TEXT artifacts become
+   *  one `texts` entry each, carrying the id and name of the artifact they came from, and BINARY ones
+   *  (`X-Artifact-Format: file`) become raw `files` entries that name their source artifact too.
+   *  Attribution is per artifact rather than a whole-run id list — the id is known for the exact block
+   *  fetched, so nothing has to be inferred from the text later. Resolution is permissive: every skipped
+   *  attachment is returned in `omissions`; callers that need complete evidence should use
+   *  `enrichInventory({ strictAttachments: true })`. */
   async resolveAttachments(attachmentIds: string[]): Promise<{
-    text?: string;
-    files: Array<{ filename: string; content_b64: string }>;
+    texts: Array<{
+      text: string;
+      source_artifact_id: string;
+      filename: string;
+    }>;
+    files: Array<{
+      filename: string;
+      content_b64: string;
+      source_artifact_id: string;
+    }>;
     omissions: AttachmentOmission[];
   }> {
-    const parts: string[] = [];
-    const files: Array<{ filename: string; content_b64: string }> = [];
+    const texts: Array<{
+      text: string;
+      source_artifact_id: string;
+      filename: string;
+    }> = [];
+    const files: Array<{
+      filename: string;
+      content_b64: string;
+      source_artifact_id: string;
+    }> = [];
     const omissions: AttachmentOmission[] = attachmentIds
       .slice(20)
       .map((attachmentId) => ({
@@ -723,7 +885,11 @@ export class InventoryManagerApi {
           }
         }
         if (resp.headers.get("X-Artifact-Format") === "file") {
-          files.push({ filename: name, content_b64: content });
+          files.push({
+            filename: name,
+            content_b64: content,
+            source_artifact_id: aid,
+          });
           continue;
         }
         if (total >= 500_000) {
@@ -734,7 +900,11 @@ export class InventoryManagerApi {
           continue;
         }
         const chunk = content.slice(0, Math.min(80_000, 500_000 - total));
-        parts.push(`--- Attached: ${name} ---\n${chunk}`);
+        texts.push({
+          text: chunk,
+          source_artifact_id: aid,
+          filename: name,
+        });
         total += chunk.length;
       } catch (error) {
         omissions.push({
@@ -743,8 +913,7 @@ export class InventoryManagerApi {
         });
       }
     }
-    const text = parts.join("\n\n");
-    return { text: text.trim() ? text : undefined, files, omissions };
+    return { texts, files, omissions };
   }
 
   /**
@@ -782,7 +951,23 @@ export class InventoryManagerApi {
       timeoutMs?: number;
       onProgress?: ProgressCallback;
       attachmentsText?: string;
-      attachmentsFiles?: Array<{ filename: string; content_b64: string }>;
+      /** One entry per attached artifact — keeps each block's own attribution, which a single opaque
+       *  `attachmentsText` blob cannot express. */
+      attachmentsTexts?: Array<{
+        text: string;
+        source_artifact_id?: string | null;
+        filename?: string | null;
+      }>;
+      /** The artifacts an opaque `attachmentsText` blob came from (whole-run provenance). */
+      attachedArtifactIds?: string[];
+      attachmentsFiles?: Array<{
+        filename: string;
+        content_b64: string;
+        source_artifact_id?: string | null;
+      }>;
+      /** An OpenVEX 0.2.0 / CSAF 2.0 VEX document (text) — `not_affected`/`fixed` statements for a CVE on a
+       *  submitted asset's CPE / purl mark that finding `suppressed_by_vex` in the result. */
+      vexOverlay?: string;
     } = {},
   ): Promise<Record<string, unknown>> {
     validatePollOptions(
@@ -793,8 +978,14 @@ export class InventoryManagerApi {
     if (options.include) body.include = options.include;
     if (options.attachmentsText)
       body.attachments_text = options.attachmentsText;
+    if (options.attachmentsTexts?.length)
+      body.attachments_texts = options.attachmentsTexts;
+    if (options.attachedArtifactIds?.length)
+      body.attached_artifact_ids = options.attachedArtifactIds;
     if (options.attachmentsFiles?.length)
       body.attachments_files = options.attachmentsFiles;
+    if (options.vexOverlay)
+      body.vex_overlay = { format: "vex", content: options.vexOverlay };
     const submit = (await (
       await this.request("POST", "/v1/inventory-enrich", { json: body })
     ).json()) as { enrichment_id: string };
@@ -814,9 +1005,11 @@ export class InventoryManagerApi {
   }
 
   /** Parse a scan / inventory FILE into canonical asset items WITHOUT saving anything (the parse-only twin
-   *  of `importInventory`). You PICK the `format` — one of json/sbom/csv/nmap/list/grype/trivy/depcheck/nessus/gvm/xlsx
-   *  (no auto-detect; pass a `Uint8Array` for the binary `xlsx`). Resolves
-   *  `{ format, items, count, inventory_name?, truncated? }`. Usage-exempt — the building block for `ingestScan`. */
+   *  of `importInventory`). You PICK the `format` — one of json/sbom/csv/nmap/list/grype/trivy/depcheck/nessus/gvm/xlsx/vex
+   *  (no auto-detect; pass a `Uint8Array` for the binary `xlsx`; `vex` is a VEX suppression overlay
+   *  parse — OpenVEX/CSAF — returning `{ items: [], vex_overlay }`). Resolves
+   *  `{ format, items, count, inventory_name?, truncated?, dropped? }` (`dropped` — SBOM only — is the
+   *  dependency edges not retained, #334). Usage-exempt — the building block for `ingestScan`. */
   async parseScan(
     content: string | Uint8Array,
     format: string,
@@ -831,10 +1024,11 @@ export class InventoryManagerApi {
 
   /** Scan → briefing in one call: parse the scan FILE (`parseScan`), enrich the discovered assets against
    *  the `/v1/inventory-enrich` ranking engine, and assemble a structured briefing. `format` is one of
-   *  json/sbom/csv/nmap/list/grype/trivy/depcheck/nessus/gvm/xlsx. The parse is usage-exempt; the enrichment **submit counts
+   *  json/sbom/csv/nmap/list/grype/trivy/depcheck/nessus/gvm/xlsx/vex. The parse is usage-exempt; the enrichment **submit counts
    *  toward usage** (one `/v1/inventory-enrich` request). Resolves
-   *  `{ format, parsed_count, truncated?, enrichment_id, report, recommended_actions }` (report = the
-   *  engine's KEV-first-ranked findings + rollup). An empty parse short-circuits to
+   *  `{ format, parsed_count, truncated?, enrichment_id, report, recommended_actions, unverified_assets }`
+   *  (report = the engine's KEV-first-ranked findings + rollup; unverified_assets names the assets whose
+   *  identity never resolved). An empty parse short-circuits to
    *  `{ format, parsed_count: 0, enrichment_id: null, empty: true }`. */
   async ingestScan(
     content: string | Uint8Array,

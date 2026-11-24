@@ -13,6 +13,7 @@
  */
 
 import { UnexpectedStatus } from "./exceptions";
+import { type Tlp, validateTlp } from "./tlp";
 import { pathSegment } from "./url";
 
 /** A fetch-like function — the CrawlerClient hands in its retry/timeout wrapper. */
@@ -95,6 +96,8 @@ export interface ArtifactManagerArtifact {
     | "inventory_enrichment"
     | "inventory_asset";
   name: string;
+  /** The artifact's own TLP 2.0 marking. Never null (legacy rows read `"AMBER"`). */
+  tlp: Tlp;
   mime?: string | null;
   format?: string | null;
   content?: string | null;
@@ -120,6 +123,8 @@ export interface ArtifactManagerRawArtifact {
   name: string;
   format: string;
   mime: string;
+  /** The artifact's own TLP 2.0 marking (from the `X-Artifact-Tlp` header). */
+  tlp: string;
   created_at: string;
 }
 
@@ -136,6 +141,14 @@ export interface ArtifactManagerExport {
 export interface ArtifactManagerRating {
   rating: "up" | "down" | null;
   counts: { up: number; down: number };
+}
+
+/** The default TLP 2.0 marking a NEW enrichment starts from — two independent values, `AMBER` when unset. */
+export interface EnricherSettings {
+  /** Artifact Enricher runs. */
+  artifact_tlp: Tlp;
+  /** Inventory Enricher runs. */
+  inventory_tlp: Tlp;
 }
 
 /**
@@ -203,7 +216,8 @@ export class ArtifactManagerApi {
    * List your artifacts (newest first, no content).
    *
    * @param options `kind` (input|enrichment|report) · `folder` (UUID or `"__root__"`)
-   *   · `since`/`until` (ISO `created_at` window).
+   *   · `since`/`until` (ISO `created_at` window) · `search` (names and contents, like the portal's search box)
+   *   · `tlp` (filter by exact TLP 2.0 marking; each returned artifact carries its own `tlp`).
    */
   async listArtifacts(
     options: {
@@ -216,13 +230,19 @@ export class ArtifactManagerApi {
       folder?: string;
       since?: string;
       until?: string;
+      search?: string;
+      /** Filter by exact TLP 2.0 marking. An invalid value throws a `RangeError` before any request. */
+      tlp?: Tlp;
     } = {},
   ): Promise<ArtifactManagerArtifact[]> {
+    const tlp = validateTlp(options.tlp);
     const params: Record<string, string> = {};
     if (options.kind) params.kind = options.kind;
     if (options.folder) params.folder = options.folder;
     if (options.since) params.since = options.since;
     if (options.until) params.until = options.until;
+    if (options.search) params.search = options.search;
+    if (tlp !== undefined) params.tlp = tlp;
     const resp = await this.request("GET", "/artifact-manager/artifacts", {
       params,
     });
@@ -234,7 +254,8 @@ export class ArtifactManagerApi {
    * Upload input artifacts (max 20/call, ≤10 MB content each).
    *
    * @param artifacts Each `{ name, content, format: "paste"|"file", mime? }`.
-   * @param options File into an existing `folderId`, or create one via `newFolderName`.
+   * @param options File into an existing `folderId`, or create one via `newFolderName`; `tlp` marks
+   *   EVERY artifact in the batch (default `AMBER`).
    * @returns `{ ids, folderId }` — the new artifact ids.
    */
   async uploadArtifacts(
@@ -244,12 +265,14 @@ export class ArtifactManagerApi {
       format: "paste" | "file";
       mime?: string;
     }>,
-    options: { folderId?: string; newFolderName?: string } = {},
+    options: { folderId?: string; newFolderName?: string; tlp?: Tlp } = {},
   ): Promise<{ ids: string[]; folderId: string | null }> {
+    const tlp = validateTlp(options.tlp);
     const body: Record<string, unknown> = { artifacts };
     if (options.folderId !== undefined) body.folderId = options.folderId;
     if (options.newFolderName !== undefined)
       body.newFolderName = options.newFolderName;
+    if (tlp !== undefined) body.tlp = tlp;
     const resp = await this.request("POST", "/artifact-manager/artifacts", {
       json: body,
     });
@@ -287,24 +310,33 @@ export class ArtifactManagerApi {
       name: decodeHeader(resp.headers.get("x-artifact-name"), artifactId),
       format: resp.headers.get("x-artifact-format") ?? "",
       mime: resp.headers.get("x-artifact-mime") ?? "",
+      tlp: resp.headers.get("x-artifact-tlp") ?? "",
       created_at: resp.headers.get("x-artifact-created") ?? "",
     };
   }
 
   /**
-   * Partial update: rename, star/unstar, and/or move between folders.
+   * Partial update: rename, star/unstar, move between folders, and/or set the TLP marking.
    *
    * `folderId: null` moves the artifact back to root; omit it to leave the
-   * folder unchanged.
+   * folder unchanged. A call that sets only `tlp` is valid; an invalid value
+   * throws a `RangeError` before any request.
    */
   async updateArtifact(
     artifactId: string,
-    update: { name?: string; favorite?: boolean; folderId?: string | null },
+    update: {
+      name?: string;
+      favorite?: boolean;
+      folderId?: string | null;
+      tlp?: Tlp;
+    },
   ): Promise<ArtifactManagerArtifact> {
+    const tlp = validateTlp(update.tlp);
     const body: Record<string, unknown> = {};
     if (update.name !== undefined) body.name = update.name;
     if (update.favorite !== undefined) body.favorite = update.favorite;
     if ("folderId" in update) body.folderId = update.folderId;
+    if (tlp !== undefined) body.tlp = tlp;
     const resp = await this.request(
       "PATCH",
       `/artifact-manager/artifacts/${pathSegment(artifactId)}`,
@@ -414,12 +446,20 @@ export class ArtifactManagerApi {
 
   /** Bundle an explicit set of your artifacts into one `.zip` (the bulk "Download .zip"). Enrichments
    *  contribute their machine exports under a per-enrichment subfolder; every other kind contributes its raw
-   *  deliverable. Returns the raw `.zip` bytes. See {@link downloadFolder} for the whole-folder twin. */
-  async downloadBundle(artifactIds: string[]): Promise<Uint8Array> {
+   *  deliverable. Returns the raw `.zip` bytes. `options.tlp` marks every wrapped export, overriding each
+   *  artifact's own stored TLP; omit it to mark each with that artifact's own TLP.
+   *  See {@link downloadFolder} for the whole-folder twin. */
+  async downloadBundle(
+    artifactIds: string[],
+    options: { tlp?: Tlp } = {},
+  ): Promise<Uint8Array> {
+    const tlp = validateTlp(options.tlp);
+    const body: Record<string, unknown> = { ids: artifactIds };
+    if (tlp !== undefined) body.tlp = tlp;
     const resp = await this.request(
       "POST",
       "/artifact-manager/artifacts/bundle",
-      { json: { ids: artifactIds } },
+      { json: body },
     );
     return new Uint8Array(await resp.arrayBuffer());
   }
@@ -462,14 +502,22 @@ export class ArtifactManagerApi {
   }
 
   /** Download one export. The body is the export file; `filename` is a sanitized basename from
-   *  `Content-Disposition`. Text formats land in `content`; binary XLSX formats in `bytes`. */
+   *  `Content-Disposition`. Text formats land in `content`; binary XLSX formats in `bytes`.
+   *
+   *  `options.tlp` sets the TLP 2.0 marking written into the export (`CLEAR` / `GREEN` / `AMBER` /
+   *  `AMBER+STRICT` / `RED`), overriding the artifact's stored TLP; omit it to stamp the artifact's
+   *  own stored TLP. Formats with no marking slot — OpenVEX, CSV and the
+   *  DISA eMASS worksheet — ignore it. An invalid value throws a `RangeError` before any request. */
   async getExport(
     enrichmentId: string,
     format: string,
+    options: { tlp?: Tlp } = {},
   ): Promise<ArtifactManagerExport> {
+    const tlp = validateTlp(options.tlp);
     const resp = await this.request(
       "GET",
       `/artifact-manager/artifacts/${pathSegment(enrichmentId)}/exports/${pathSegment(format)}`,
+      tlp === undefined ? {} : { params: { tlp } },
     );
     const disposition = resp.headers.get("content-disposition") ?? "";
     const filename = downloadFilename(disposition, format);
@@ -487,11 +535,17 @@ export class ArtifactManagerApi {
   /** Download EVERY machine export of a saved artifact as one `.zip` (one file per format —
    *  `stix.json`, `vex.json`, `emass.xlsx`, …). The bulk twin of {@link getExport}, matching the export
    *  panel's "Download all (.zip)" button. Works for any saved enrichment / inventory-enrichment /
-   *  inventory id. Returns the raw `.zip` bytes. */
-  async downloadAllExports(enrichmentId: string): Promise<Uint8Array> {
+   *  inventory id. Returns the raw `.zip` bytes. `options.tlp` marks each export, overriding the
+   *  artifact's stored TLP; omit it to stamp each with the artifact's own stored TLP. */
+  async downloadAllExports(
+    enrichmentId: string,
+    options: { tlp?: Tlp } = {},
+  ): Promise<Uint8Array> {
+    const tlp = validateTlp(options.tlp);
     const resp = await this.request(
       "GET",
       `/artifact-manager/artifacts/${pathSegment(enrichmentId)}/exports/all`,
+      tlp === undefined ? {} : { params: { tlp } },
     );
     return new Uint8Array(await resp.arrayBuffer());
   }
@@ -556,12 +610,57 @@ export class ArtifactManagerApi {
 
   /** Download every artifact filed under a folder as one `<folder>.zip` (the folder "Download .zip").
    *  Enrichments contribute their machine exports under a per-enrichment subfolder; every other kind
-   *  contributes its raw deliverable. Returns the raw `.zip` bytes. */
-  async downloadFolder(folderId: string): Promise<Uint8Array> {
+   *  contributes its raw deliverable. Returns the raw `.zip` bytes. `options.tlp` marks every wrapped
+   *  export, overriding each artifact's own stored TLP; omit it to mark each with that artifact's own
+   *  stored TLP. */
+  async downloadFolder(
+    folderId: string,
+    options: { tlp?: Tlp } = {},
+  ): Promise<Uint8Array> {
+    const tlp = validateTlp(options.tlp);
     const resp = await this.request(
       "GET",
       `/artifact-manager/folders/${pathSegment(folderId)}/exports/all`,
+      tlp === undefined ? {} : { params: { tlp } },
     );
     return new Uint8Array(await resp.arrayBuffer());
+  }
+
+  // -- Enricher settings -------------------------------------------------- //
+
+  /** Your default TLP 2.0 marking for NEW enrichments, as two independent values —
+   *  `AMBER` for either one you have not set. The Artifact Enricher page's Settings
+   *  button edits the same two values. */
+  async getEnricherSettings(): Promise<EnricherSettings> {
+    const resp = await this.request("GET", "/artifact-manager/settings");
+    return (await resp.json()) as EnricherSettings;
+  }
+
+  /** Set the default marking a NEW enrichment starts from. Pass one or both — only what
+   *  you pass is written, and the stored pair is returned. An invalid value throws
+   *  before any request; passing neither throws too.
+   *
+   *  The value is a BASELINE, not an override: an enrichment saved afterwards is marked
+   *  with the most restrictive of the setting and the artifacts it was built from, so a
+   *  more restrictive source still wins. An explicit `tlp` on `client.enricher.enrich(...)`
+   *  overrides `artifact_tlp` for that run's exports. */
+  async setEnricherSettings(options: {
+    artifactTlp?: Tlp;
+    inventoryTlp?: Tlp;
+  }): Promise<EnricherSettings> {
+    const artifactTlp = validateTlp(options.artifactTlp);
+    const inventoryTlp = validateTlp(options.inventoryTlp);
+    const json: { artifact_tlp?: Tlp; inventory_tlp?: Tlp } = {};
+    if (artifactTlp !== undefined) json.artifact_tlp = artifactTlp;
+    if (inventoryTlp !== undefined) json.inventory_tlp = inventoryTlp;
+    if (!Object.keys(json).length) {
+      throw new RangeError(
+        "setEnricherSettings needs artifactTlp and/or inventoryTlp",
+      );
+    }
+    const resp = await this.request("PUT", "/artifact-manager/settings", {
+      json,
+    });
+    return (await resp.json()) as EnricherSettings;
   }
 }

@@ -28,9 +28,7 @@ Turn a CVE into a complete attack briefing with one typed call. ESM and CommonJS
 
 ## Project status
 
-The SDK is ready for its first public release. npm publication is pending; the version badge above will show the registry version once that release succeeds. Until then, use the repository checkout for evaluation.
-
-A checkout carries the hand-written wrapper without the generated request layer, so run `npm run codegen -- --snapshot-only` once before you build or test it. The published package ships both layers, so installing from npm never needs code generation.
+A repository checkout carries the hand-written wrapper without the generated request layer, so run `npm run codegen -- --snapshot-only` once before you build or test it. The published package ships both layers, so installing from npm never needs code generation.
 
 ## Install
 
@@ -40,7 +38,7 @@ npm install @crimson-crawler/crimson-crawler-client
 pnpm add @crimson-crawler/crimson-crawler-client
 ```
 
-These commands apply once the first npm release is available.
+Published on [npm](https://www.npmjs.com/package/@crimson-crawler/crimson-crawler-client); the commands above install the latest release.
 
 Node 22+ is the supported runtime. The default transport uses Node's built-in `fetch`; setting `verifySsl: false` dynamically imports `undici`. Browser and edge runtimes are not tested or supported.
 
@@ -91,14 +89,20 @@ import { CrawlerClient } from "@crimson-crawler/crimson-crawler-client";
 const client = new CrawlerClient();
 const result = await client.enrichCveFull("CVE-2024-3400");
 
-console.log(result.cve?.cvss_score);
+console.log(result.cve?.cvss_v3_score, result.cve?.cvss_v4_score);
 
 for (const t of result.techniques ?? []) {
   console.log(t.technique_id, t.name);
 }
 ```
 
-Optional chaining (`result.cve?.cvss_score`) and nullish coalescing (`result.techniques ?? []`) are the recommended patterns. Every layer of an enrichment response is independently optional, since any single upstream lookup may have no data.
+Optional chaining (`result.cve?.cvss_v3_score`) and nullish coalescing (`result.techniques ?? []`) are the recommended patterns. Every layer of an enrichment response is independently optional, since any single upstream lookup may have no data.
+
+OSV advisories may span pages. Use `iterCveOsvPages(cveId)` or
+`iterVulnerabilityExposureOsvPages(cveIds)` to stream them without collecting the full walk.
+Pass an explicit `include` containing `osv_restricted` for restricted or unknown-licence records.
+An expired snapshot throws `UnexpectedStatus`; restart the walk rather than appending a new
+snapshot to pages already consumed.
 
 ## The client
 
@@ -141,27 +145,27 @@ There's no `close()` to call. Reuse a single `CrawlerClient` instance for the li
 
 ## Convenience methods
 
-**Every `/v1` operation has a method** — 33 of them, plus the `searchTechniques` shortcut. The seven documented in full below cover the highest-traffic patterns; the rest are grouped after them with their signatures. The 15 `enrich*Full` methods call their endpoint with a full-walk `include` preset baked in (pass `include` to override); the others take no preset. Every method returns a promise of a typed response and throws `UnexpectedStatus` on a non-2xx.
+**Every `/v1` operation has a method** — 38 of them, plus the `searchTechniques` shortcut. The seven documented in full below cover the highest-traffic patterns; the rest are grouped after them with their signatures. The 17 `enrich*Full` methods call their endpoint with a full-walk `include` preset baked in (pass `include` to override); the others take no preset. Every method returns a promise of a typed response and throws `UnexpectedStatus` on a non-2xx.
 
 | Group | Methods |
 |---|---|
-| Full-walk enrichment (15) | `enrichCveFull` · `enrichIocFull` · `enrichCweFull` · `enrichTechniqueFull` · `enrichProductFull` · `enrichPackageFull` · `enrichCapecFull` · `enrichGroupFull` · `enrichSoftwareFull` · `enrichCampaignFull` · `enrichAtlasFull` · `enrichDisarmFull` · `enrichDefendFull` · `enrichLocationFull` · `enrichSectorFull` |
+| Full-walk enrichment (17) | `enrichCveFull` · `enrichIocFull` · `enrichCweFull` · `enrichTechniqueFull` · `enrichProductFull` · `enrichPackageFull` · `enrichCapecFull` · `enrichGroupFull` · `enrichSoftwareFull` · `enrichCampaignFull` · `enrichAtlasFull` · `enrichDisarmFull` · `enrichDefendFull` · `enrichF3Full` · `enrichCloakFull` · `enrichLocationFull` · `enrichSectorFull` |
 | Enrichment, no preset (2) | `enrichBatch` · `enrichPocSource` |
-| Search (8 + 1) | `searchCve` · `searchCti` · `searchKev` · `searchMisp` · `searchKnowledgebase` · `searchVendor` · `searchPoc` · `searchD3fend` · `searchTechniques` |
+| Search (9 + 1) | `searchCve` · `searchCti` · `searchCsaf` · `searchKev` · `searchMisp` · `searchKnowledgebase` · `searchVendor` · `searchPoc` · `searchD3fend` · `searchTechniques` |
 | Assessment (4) | `assessTechniqueCoverage` · `assessVulnerabilityExposure` · `assessGroupExposure` · `assessIocPortfolio` |
-| Async engines (4) | `artifactEnrich` · `artifactEnrichStatus` · `inventoryEnrich` · `inventoryEnrichStatus` |
+| Async engines (6) | `artifactEnrich` · `artifactEnrichStatus` · `inventoryEnrich` · `inventoryEnrichStatus` · `eventEnrich` · `eventEnrichStatus` |
 
 Names are the exact camelCase of the Python ones, so anything you read in the [Python guide](https://crimsoncrawler.com/docs/clients/python-client/) transfers. One to watch: the wrapper method is **`searchD3fend`** (lowercase `f`), while the generated function it wraps is `searchD3Fend`.
 
 #### `enrichCveFull(cveId, include?)`
 
-Returns CVE details, EPSS exploit probability, KEV status, mapped weaknesses, attack patterns, ATT&CK techniques, TIE threat predictions, MISP events, knowledge-base context, and web findings. Single request.
+Returns CVE details, EPSS, KEV, weaknesses, attack patterns, ATT&CK techniques, TIE predictions and other default-on source layers. MISP and knowledge-base context require explicit includes.
 
 ```ts
 const client = new CrawlerClient();
 const result = await client.enrichCveFull("CVE-2024-3400");
 
-console.log(`CVSS: ${result.cve?.cvss_score} (${result.cve?.cvss_severity})`);
+console.log(`CVSS v${result.cve?.cvss_v3_version}: ${result.cve?.cvss_v3_score} (${result.cve?.cvss_v3_severity})`);
 console.log(`Description: ${result.cve?.description}`);
 
 if (result.epss) console.log(`EPSS: ${result.epss.epss}`);
@@ -186,7 +190,7 @@ Returns: `Promise<EnrichCveResponse>`.
 
 #### `enrichIocFull(value, iocType?, include?)`
 
-Returns MISP attribute matches, linked ATT&CK techniques, attributed threat groups, knowledge-base context, and web findings for an indicator (IP, hash, domain, URL).
+Returns MISP attribute matches, linked ATT&CK techniques, defensive context, sightings, warninglists and list/network context for an indicator. Request other layers explicitly.
 
 ```ts
 const result = await client.enrichIocFull("203.0.113.5", "ip-dst");
@@ -222,7 +226,7 @@ console.log(`Techniques: ${result.techniques?.length ?? 0}`);
 
 Returns: `Promise<EnrichCweResponse>`.
 
-#### `enrichTechniqueFull(techniqueIds, framework?, include?)`
+#### `enrichTechniqueFull(techniqueIds?, framework?, include?, assetId?)`
 
 Returns technique details, TIE predictions, attributed groups, software, campaigns, and a Navigator JSON layer for one or more ATT&CK techniques.
 
@@ -242,25 +246,28 @@ for (const g of result.groups ?? []) {
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `techniqueIds` | `string[]` | required | ATT&CK technique IDs. |
-| `framework` | `"enterprise" \| "ics" \| "mobile"` | `"enterprise"` | ATT&CK matrix variant. |
+| `techniqueIds` | `string[]` | optional | ATT&CK technique IDs. Omitted (sent UNSET) when you look up by `assetId`. |
+| `framework` | `"enterprise" \| "ics" \| "mobile"` | `"enterprise"` | ATT&CK matrix variant. `assetId` requires `"ics"`. |
+| `assetId` | `string` | — | ICS asset id (`^A\\d{4}$`) — looks a technique up FROM an asset instead. Mutually exclusive with `techniqueIds` / `techniqueId` / `search` (the API answers 422). The response carries the resolved `asset` plus its real targets in `techniques[]`. |
 | `include` | `readonly string[]` | `presets.TECHNIQUE_FULL` | Override the default include list. |
 
 Returns: `Promise<EnrichTechniqueResponse>`.
 
 #### `enrichProductFull(product, options?)`
 
-Finds vulnerabilities affecting a product/version and enriches each matched CVE with severity, exploit signals, weakness mapping, ATT&CK techniques, threat predictions, MISP events, and web context.
+Returns a page of enriched CVEs for a product and version.
+
+The pinned Vulmatch bundle route cannot look up CPE identifiers containing `/`, `?`, `#`, `%`, or
+backslash escapes of those characters, including all CPE 2.2 URIs. Affected lookups report
+service `vulnerability-data` and error `unroutable_identifier` in `errors[]` rather than a confirmed empty result; failures
+are not cached. A lossless route is tracked in issue #473.
 
 ```ts
-const result = await client.enrichProductFull("Apache HTTP Server", {
+for await (const page of client.iterProductCves("http_server", {
   version: "2.4.51",
   vendor: "apache",
-});
-
-for (const cve of result.cves ?? []) {
-  console.log(`${cve.cve_id}: ${cve.cvss_score} (${cve.cvss_severity})`);
-  if (cve.kev?.in_kev) console.log("  in KEV");
+})) {
+  for (const row of page.cves ?? []) console.log(row.discovered_cve_id);
 }
 ```
 
@@ -270,19 +277,28 @@ for (const cve of result.cves ?? []) {
 | `options.version` | `string` | — | Specific version (e.g. `"2.4.51"`). Optional. |
 | `options.vendor` | `string` | — | Vendor name to narrow results (e.g. `"apache"`). Optional. |
 | `options.include` | `readonly string[]` | `presets.PRODUCT_FULL` | Override the default include list. |
+| `options.limit` | `number` | `2` | Maximum CVEs per page, 1–20. The full preset pages smaller than the API default. |
+| `options.offset` | `number` | `0` | Zero-based page offset. |
+| `options.snapshotId` | `string` | — | First page's snapshot ID, required when requesting a later offset. |
 
 Returns: `Promise<EnrichProductResponse>`.
 
+`cves_discovered` counts the bounded discovery set. `rollups_over` counts the CVEs actually
+enriched, up to `cves_enrichment_limit`; `discovery_truncated` and its reason describe whether
+discovery was incomplete or its completeness is unknown.
+The SDK reconstructs the per-CVE context lists from the response's page-local catalogue.
+Keep page 0's product-level sections; later pages contain CVE rows and paging metadata only.
+Single-page results need no snapshot. Iterators restart once on an expired snapshot.
+
 #### `enrichPackageFull(ecosystem, package, opts?)`
 
-The package-ecosystem sibling of `enrichProductFull`. OSV.dev supplies the package's advisories (npm / PyPI / Go / Maven / crates.io …, including the non-CVE GHSA / PYSEC / RUSTSEC / GO findings the CPE-keyed product endpoint can't reach), and the CVEs they alias are enriched through the same CWE → CAPEC → ATT&CK + EPSS/KEV chain.
+The package-ecosystem sibling of `enrichProductFull` reads advisories from the stored OSV generation. Default results include permissive sources only; add `osv_restricted` to an explicit include list for restricted and unknown-licence package and nested CVE advisories. This is a breaking change from the prior live query: default results may shrink.
+
+**Breaking OSV licence change:** CVE-linked `osv` returns permissive records only. Requests that previously received restricted or unknown-licence records must add `osv_restricted` to the CVE `include` list alongside any other layers needed. An explicit list replaces the preset. On package enrichment, `osv_restricted` applies to nested CVEs, not the package advisory list. Check source terms before redistribution.
 
 ```ts
-const result = await client.enrichPackageFull('npm', 'lodash');
-
-for (const cve of result.cves ?? []) {
-  console.log(`${cve.cve_id}: ${cve.cvss_score} (${cve.cvss_severity})`);
-  if (cve.kev?.in_kev) console.log("  in KEV");
+for await (const page of client.iterPackageAdvisories("npm", "lodash")) {
+  for (const advisory of page.advisories ?? []) console.log(advisory.id);
 }
 ```
 
@@ -292,8 +308,15 @@ for (const cve of result.cves ?? []) {
 | `package` | `string` | required | Package name within the ecosystem, e.g. `"lodash"`. |
 | `opts.version` | `string` | — | Specific version (e.g. `"4.0"`). Optional. |
 | `opts.include` | `readonly string[]` | `presets.PACKAGE_FULL` | Override the default include list. |
+| `opts.limit` | `number` | `5` | Maximum advisories and CVEs per page, 1–20. |
+| `opts.offset` | `number` | `0` | Returned `next_offset` for a continuation. |
+| `opts.snapshotId` | `string` | — | Page-zero snapshot ID, required for continuation. |
 
 Returns: `Promise<EnrichPackageResponse>`.
+
+The method returns one page. `iterPackageAdvisories` streams pages without an aggregate buffer;
+if the snapshot expires or changes after a yield, it throws instead of silently restarting.
+Follow `next_offset`, not `offset + limit`, because byte limits can shorten a page.
 
 #### `searchTechniques(keyword, options?)`
 
@@ -314,7 +337,7 @@ for (const hit of result.results ?? []) {
 
 Returns: `Promise<SearchCtiResponse>`.
 
-#### The other nine full-walk enrichments
+#### The other eleven full-walk enrichments
 
 Same shape as the six above: a full-walk preset baked in, `include` to override. Each takes an **optional id positional or `options.search`** — pass one, not both — so you can go straight to an id or find the entity by name.
 
@@ -327,14 +350,16 @@ const ml = await client.enrichAtlasFull("AML.T0043");
 | Method | Id positional | Options | Returns |
 |---|---|---|---|
 | `enrichCapecFull(capecId?, options?)` | `CAPEC-66` | `search`, `include` | `Promise<EnrichCapecResponse>` |
-| `enrichGroupFull(groupId?, options?)` | `G0016` | `search`, `framework`, `include` | `Promise<EnrichGroupResponse>` |
+| `enrichGroupFull(groupId?, options?)` | `G0016` | `search`, `framework`, `include`, `limit`, `offset`, `snapshotId` | `Promise<EnrichGroupResponse>` |
 | `enrichSoftwareFull(softwareId?, options?)` | `S0154` | `search`, `framework`, `include` | `Promise<EnrichSoftwareResponse>` |
 | `enrichCampaignFull(campaignId?, options?)` | `C0011` | `search`, `framework`, `include` | `Promise<EnrichCampaignResponse>` |
 | `enrichAtlasFull(techniqueId?, options?)` | `AML.T0043` | `search`, `include` | `Promise<EnrichAtlasResponse>` |
 | `enrichDisarmFull(techniqueId?, options?)` | `T0001` | `search`, `include` | `Promise<EnrichDisarmResponse>` |
 | `enrichDefendFull(d3fendId?, options?)` | `D3-NTA` | `search`, `include` | `Promise<EnrichDefendResponse>` |
-| `enrichLocationFull(locationId?, options?)` | `L0001` | `search`, `include` | `Promise<EnrichLocationResponse>` |
-| `enrichSectorFull(sectorId?, options?)` | `financial-services` | `search`, `include` | `Promise<EnrichSectorResponse>` |
+| `enrichF3Full(f3Id?, options?)` | `F1031` | `search`, `include` | `Promise<EnrichF3Response>` |
+| `enrichCloakFull(cloakId?, options?)` | `TTP-496` | `search`, `include` | `Promise<EnrichCloakResponse>` |
+| `enrichLocationFull(locationId?, options?)` | `US` | `search`, `include` | `Promise<EnrichLocationResponse>` |
+| `enrichSectorFull(sectorId?, options?)` | `financial-organizations` | `search`, `include` | `Promise<EnrichSectorResponse>` |
 
 `framework` is `"enterprise"` (default), `"ics"`, or `"mobile"`, and only exists where the endpoint supports a matrix variant.
 
@@ -373,9 +398,14 @@ These methods retrieve and analyze public proof-of-concept exploit material. Use
 
 Returns: `Promise<EnrichPocSourceResponse>`.
 
-#### Search (8 methods)
+#### Search (9 methods)
 
-One method per search endpoint. `searchCve` is the only one that accepts `include`; none of them uses a preset. `searchKev` and `searchMisp` take options only — call them bare to browse.
+One method per search endpoint. `searchCve` defaults to `details`, `statistics`, `cna`, `epss_reports`, and `kb_rankings`; an explicit `include` replaces the defaults. Rankings keep the first 100 rows per knowledge base without yearly trends; `kb_rankings_total` and `kb_rankings_truncated` describe the reduction, and `kb_rankings_full` restores all fetched rows and trends. `searchMisp`, `searchCti`, `searchKev`, and `searchD3fend` also accept `include`. No search method uses a preset. `searchKev` and `searchMisp` take options only.
+
+**5.0.0 migration — MISP event bodies:** `searchMisp` returns event summaries by default. Request
+`include: ["misp_events_full"]` for full event bodies; `objects` also returns full bodies and resolves
+object references. An explicit include replaces the defaults (`event_reports`, `tags`, `version`), so
+add those values too if needed. Event pages are not snapshots and can shift when MISP data changes.
 
 ```ts
 const weaponized = await client.searchCve(undefined, { kevOnly: true, epssMin: 0.9, limit: 20 });
@@ -386,13 +416,14 @@ const answer = await client.searchKnowledgebase("how do I detect kerberoasting",
 | Method | Options | Returns |
 |---|---|---|
 | `searchCve(query?, options?)` | `cveId`, `stixId`, `cweId`, `capecId`, `attackId`, `cpe`, `cpesNotVulnerable`, `createdByRef`, `createdMin`, `createdMax`, `modifiedMin`, `modifiedMax`, `cvssMin`, `cvssV2Min`, `cvssV4Min`, `epssMin`, `epssPercentileMin`, `kevOnly`, `vulnStatus`, `sort`, `include`, `limit`, `page` | `Promise<SearchCveResponse>` |
-| `searchCti(query, options?)` | `sources`, `types`, `limit`, `page`, `deprecated`, `revoked` | `Promise<SearchCtiResponse>` |
+| `searchCti(query, options?)` | `sources`, `types`, `limit`, `page`, `deprecated`, `revoked`, `include` | `Promise<SearchCtiResponse>` |
 | `searchKev(options?)` | `cveId`, `ransomwareStatus`, `limit`, `page` | `Promise<SearchKevResponse>` |
-| `searchMisp(options?)` | `value`, `typeAttribute`, `category`, `toIds`, `eventId`, `eventinfo`, `tags`, `threatLevelId`, `published`, `dateFrom`, `dateTo`, `limit`, `page` | `Promise<SearchMispResponse>` |
+| `searchMisp(options?)` | `value`, `typeAttribute`, `category`, `toIds`, `eventId`, `eventinfo`, `tags`, `threatLevelId`, `published`, `dateFrom`, `dateTo`, `limit`, `page`, `include` | `Promise<SearchMispResponse>` |
 | `searchKnowledgebase(query, options?)` | `collections`, `alpha`, `limit` | `Promise<SearchKnowledgebaseResponse>` |
-| `searchVendor(vendor, options?)` | `limit` | `Promise<SearchVendorResponse>` |
+| `searchVendor(vendor?, options?)` | `q`, `limit` — omit `vendor` to list the vendor directory | `Promise<SearchVendorResponse>` |
 | `searchPoc(cveId, options?)` | `limit` | `Promise<SearchPocResponse>` |
-| `searchD3fend(query, options?)` | `d3fendForm`, `limit`, `page` | `Promise<SearchD3FendResponse>` |
+| `searchD3fend(query, options?)` | `d3fendForm`, `limit`, `page`, `include` | `Promise<SearchD3FendResponse>` |
+| `searchCsaf(options?)` | `cveId`, `advisoryId`, `publisher`, `sector`, `product`, `cpe`, `tlp`, `sort`, `limit`, `page` | `Promise<SearchCsafResponse>` |
 
 Constrained values are typed unions, so your editor completes them: `vulnStatus`, `sort`, `ransomwareStatus` (`"Known"` / `"Unknown"`), `d3fendForm` (`"tactic"` / `"mitigation"` / `"sub-mitigation"` / `"artifact"`), `collections` (`"main"` / `"large"` / `"user"` / `"red_team"`), and `types` (`"attack-pattern"` / `"intrusion-set"` / `"malware"` / `"tool"` / `"campaign"` / `"weakness"` / `"course-of-action"`).
 
@@ -416,14 +447,19 @@ const portfolio = await client.assessIocPortfolio([
 |---|---|---|
 | `assessTechniqueCoverage(techniqueIds, options?)` | `framework`, `include` | `Promise<AssessTechniqueCoverageResponse>` |
 | `assessVulnerabilityExposure(cveIds, options?)` | `stakeholder`, `include` | `Promise<AssessVulnerabilityExposureResponse>` |
-| `assessGroupExposure(options?)` | `groupIds`, `search`, `framework`, `include` | `Promise<AssessGroupExposureResponse>` |
+| `assessGroupExposure(options?)` | `groupIds`, `search`, `framework`, `include`, `limit`, `offset`, `snapshotId` | `Promise<AssessGroupExposureResponse>` |
 | `assessIocPortfolio(indicators, options?)` | `include` | `Promise<AssessIocPortfolioResponse>` |
 
 `stakeholder` is the SSVC decision object (`method`, `exposure`, `mission_prevalence`, `human_impact`, `public_wellbeing_impact`) and applies when `include` asks for `ssvc`. `assessGroupExposure` takes `groupIds`, free-text `search` terms, or both.
 
-#### Async engines (4 methods)
+Group and group-exposure calls return one technique page. Use `iterGroupPages` or
+`iterGroupExposurePages` to collect them. The SDK reconstructs log sources from the page
+catalogue; `aggregate_over` and `aggregate_total` show tactic coverage, and
+`context_techniques_selected` / `context_techniques_limit` disclose bounded context work.
 
-The raw submit/status pairs behind the two background enrichment engines. A submit resolves with a job handle immediately (**it counts toward your usage**); the status read is **usage-exempt**, so poll as often as you like. For a one-call version that submits, polls, and resolves with the finished report, use [`client.enricher.enrich`](#enricher-clientenricher) or `client.inventoryManager.ingestScan`.
+#### Async engines (6 methods)
+
+The raw submit/status pairs behind the three background enrichment engines. A submit resolves with a job handle immediately (**it counts toward your usage**); the status read is **usage-exempt**, so poll as often as you like. For a one-call version that submits, polls, and resolves with the finished report, use [`client.enricher.enrich`](#enricher-clientenricher) / [`client.enricher.enrichEvent`](#enricher-clientenricher) or `client.inventoryManager.ingestScan`.
 
 ```ts
 const job = await client.artifactEnrich({ text: "Suspicious login from 10.1.1.1, then CVE-2024-1234 scan" });
@@ -431,45 +467,54 @@ const status = await client.artifactEnrichStatus(job.enrichment_id);
 
 const inv = await client.inventoryEnrich([{ product: "nginx", version: "1.24.0" }]);
 const findings = await client.inventoryEnrichStatus(inv.enrichment_id);
+
+const ev = await client.eventEnrich("Suspicious login from 10.1.1.1, then CVE-2024-1234 scan", { eventId: "INC-2026-0091" });
+const verdict = await client.eventEnrichStatus(ev.enrichment_id);
 ```
 
 | Method | Options | Returns |
 |---|---|---|
-| `artifactEnrich(options?)` | `text`, `files`, `formats`, `stakeholder`, `include` | `Promise<ArtifactEnrichResponse>` |
+| `artifactEnrich(options?)` | `text`, `files`, `texts`, `attachedArtifactIds`, `formats`, `stakeholder`, `include` | `Promise<ArtifactEnrichResponse>` |
 | `artifactEnrichStatus(enrichmentId)` | — | `Promise<ArtifactEnrichStatusResponse>` |
-| `inventoryEnrich(items, options?)` | `attachmentsText`, `attachmentsFiles`, `include` | `Promise<InventoryEnrichResponse>` |
+| `inventoryEnrich(items, options?)` | `attachmentsText`, `attachmentsTexts`, `attachmentsFiles`, `attachedArtifactIds`, `include`, `vexOverlay` | `Promise<InventoryEnrichResponse>` |
 | `inventoryEnrichStatus(enrichmentId)` | — | `Promise<InventoryEnrichStatusResponse>` |
+| `eventEnrich(event, options?)` | `eventId` | `Promise<EventEnrichResponse>` |
+| `eventEnrichStatus(enrichmentId)` | — | `Promise<EventEnrichStatusResponse>` |
 
-`files` and `attachmentsFiles` are `[{ filename, content_b64 }]`; `items` are `InventoryAsset` objects (`product` is the only required key). `formats` picks the machine exports to build alongside the report (`report`, `json`, `stix`, `vex`, `csaf`, `navigator`, `kev_remediation`, `oscal_poam`, `misp`, `csv`). A submit resolves with `202` and `status: "queued"` plus a `queue_position` when your key already has 3 enrichments running; past 20 in flight it throws `UnexpectedStatus(429)` with `error: "enrichment_queue_full"`.
+`files` and `attachmentsFiles` are `[{ filename, content_b64, source_artifact_id? }]`; `texts` / `attachmentsTexts` are `[{ text, source_artifact_id?, filename? }]` — one row per attached TEXT artifact, so per-artifact provenance survives instead of being flattened into one blob (aggregate caps: 1,000,000 chars for the artifact engine's `text` + `texts[]`, 500,000 for the inventory engine's `attachments_text` + `attachments_texts[]`). `attachedArtifactIds` is the legacy whole-run id list. The inventory manager's `resolveAttachments` is a clean cutover — it resolves to `{ texts, files, omissions }` and the legacy whole-run `text` field is gone, with no alias. `items` are `InventoryAsset` objects (`product` is the only required key). `formats` picks the machine exports to build alongside the report (`report`, `json`, `stix`, `vex`, `csaf`, `navigator`, `kev_remediation`, `oscal_poam`, `misp`, `csv`). `eventEnrich` takes the raw event text (a Defender XDR / Sentinel alert, a SIEM/EDR log line, any JSON or text, ≤200,000 chars) and an optional `eventId` (≤200 chars, echoed back on the result); its `eventEnrichStatus` carries the finished `EventEnrichmentResult` (per-indicator findings + graded aggregate threat assessment). A submit resolves with `202` and `status: "queued"` plus a `queue_position` when your key already has 3 enrichments running; past 20 in flight it throws `UnexpectedStatus(429)` with `error: "enrichment_queue_full"`.
 
 ## Presets
 
 A preset is a named `readonly string[]`: a curated set of `include` values for one of the common workflows. The point is so you don't have to memorize which `include` values are valid for which endpoint, or pick the right depth for your use case every time.
 
-The `presets` namespace exports 18 — one full-walk default per enrichment endpoint that accepts `include`, plus three depth variants for the two highest-traffic ones. Names and contents are byte-identical to the Python SDK's:
+The `presets` namespace exports 20 — one full-walk default per enrichment endpoint that accepts `include`, plus three depth variants for the two highest-traffic ones. Names and contents are byte-identical to the Python SDK's:
 
 | Preset | Use for | Include values |
 |---|---|---|
-| `CVE_FULL_WALK` | Default for `enrichCveFull`. Full enrichment depth. | `details`, `epss`, `kev`, `cwe`, `capec`, `techniques`, `tie`, `misp`, `knowledgebase`, `web` |
-| `CVE_FAST` | Quick artifact-scan. Score and KEV status, nothing else. | `details`, `epss`, `kev` |
+| `CVE_FULL_WALK` | Default for `enrichCveFull`. Full enrichment depth. | `android_bulletin`, `capec`, `cellular`, `certfr_advisories`, `cisa_campaigns`, `cisa_kev`, `csaf_advisories`, `cvss_bt`, `cwe`, `details`, `detections`, `emb3d`, `epss`, `exploits`, `kev`, `log_sources`, `mitigations`, `nist_controls`, `ot_context`, `poc`, `sigma`, `osv`, `ssvc`, `techniques`, `tie`, `weakness_ranks` |
+| `CVE_FAST` | Quick artifact-scan. Score and KEV status, nothing else. | `details`, `epss`, `kev`, `cisa_kev` |
 | `CVE_NARRATIVE` | Report generation. Full walk plus AI summary and adversary attribution. | full walk + `summary`, `groups`, `campaigns` |
-| `IOC_FULL_WALK` | Default for `enrichIocFull`. | `misp_attributes`, `techniques`, `groups`, `knowledgebase`, `web` |
+| `IOC_FULL_WALK` | Default for `enrichIocFull`. | `cisa_campaigns`, `defend`, `detections`, `galaxies`, `listed_on`, `log_sources`, `misp_attributes`, `mitigations`, `network_context`, `nist_controls`, `sightings`, `techniques`, `tie`, `warninglist` |
 | `IOC_FAST` | Indicator hits in MISP feeds, nothing else. | `misp_attributes` |
 | `CWE_FULL_WALK` | Default for `enrichCweFull`. | `capecs`, `techniques`, `tie` |
-| `TECHNIQUE_FULL` | Default for `enrichTechniqueFull`. Adversary attribution + Navigator. | `details`, `tie`, `groups`, `software`, `campaigns`, `navigator` |
-| `PRODUCT_FULL` | Default for `enrichProductFull`. Per-CVE full enrichment for the matched set. | `details`, `epss`, `kev`, `cwe`, `capec`, `techniques`, `tie`, `misp`, `knowledgebase`, `web` |
+| `TECHNIQUE_FULL` | Default for `enrichTechniqueFull`. Technique detail and defensive mappings. | `asset_classes`, `atomic_red_team`, `cisa_campaigns`, `defend`, `details`, `detections`, `fight`, `framework_mappings`, `fraud`, `log_sources`, `lolbas`, `lotl`, `mitigations`, `nist_controls`, `sigma`, `tie` |
+| `PRODUCT_FULL` | Default for `enrichProductFull`. | Seeded product layers plus `misp` and `knowledgebase`; see `presets.ts`. |
 | `PACKAGE_FULL` | Default for `enrichPackageFull`. OSV advisories + per-CVE full enrichment. | `details`, `severity`, `affected`, `references`, `epss`, `kev`, `cwe`, `capec`, `techniques`, `tie` |
 | `CAPEC_FULL` | Default for `enrichCapecFull`. Attack pattern → techniques, CVEs, actors. | `details`, `techniques`, `tie`, `cves`, `groups`, `software`, `campaigns`, `navigator` |
-| `GROUP_FULL` | Default for `enrichGroupFull`. The full actor picture. | `details`, `techniques`, `software`, `tie`, `campaigns`, `cves`, `sectors`, `locations`, `navigator` |
+| `GROUP_FULL` | Default for `enrichGroupFull`. | Group layers including detections, mitigations and NIST controls; see `presets.ts`. |
 | `SOFTWARE_FULL` | Default for `enrichSoftwareFull`. Malware / tool → who uses it and how. | `details`, `techniques`, `tie`, `groups`, `campaigns`, `cves`, `navigator` |
 | `CAMPAIGN_FULL` | Default for `enrichCampaignFull`. | `details`, `techniques`, `tie`, `groups`, `software`, `cves`, `navigator` |
-| `ATLAS_FULL` | Default for `enrichAtlasFull`. Adversarial-ML technique walk. | `details`, `techniques`, `tie`, `groups`, `software`, `campaigns`, `navigator` |
-| `DISARM_FULL` | Default for `enrichDisarmFull`. Influence-operation technique + countermeasures. | `details`, `countermeasures`, `techniques`, `tie`, `groups`, `software`, `campaigns`, `navigator` |
-| `DEFEND_FULL` | Default for `enrichDefendFull`. D3FEND has no graph hops, so this set is short by design. | `details`, `techniques`, `knowledgebase`, `web` |
-| `LOCATION_FULL` | Default for `enrichLocationFull`. Regional threat picture. | `details`, `groups`, `techniques`, `tie`, `software`, `campaigns`, `sectors`, `navigator` |
-| `SECTOR_FULL` | Default for `enrichSectorFull`. Industry threat picture. | `details`, `groups`, `techniques`, `tie`, `software`, `campaigns`, `locations`, `navigator` |
+| `ATLAS_FULL` | Default for `enrichAtlasFull`. Adversarial-ML technique walk. | `details`, `techniques` |
+| `DISARM_FULL` | Default for `enrichDisarmFull`. Influence-operation technique. | `details`, `techniques` |
+| `F3_FULL` | Default for `enrichF3Full`. MITRE F3 fraud technique → the ATT&CK techniques it borrows. No adversary graph, so the chain ends at the technique hop. | `details`, `techniques`, `knowledgebase` |
+| `CLOAK_FULL` | Default for `enrichCloakFull`. CLOAK concealment technique — no ATT&CK references, so this set is short by design. | `details`, `knowledgebase` |
+| `DEFEND_FULL` | Default for `enrichDefendFull`. D3FEND has no graph hops, so this set is short by design. | `details`, `techniques`, `knowledgebase` |
+| `LOCATION_FULL` | Default for `enrichLocationFull`. Regional profile walk — the location's own metadata plus knowledge base context. | `details`, `knowledgebase` |
+| `SECTOR_FULL` | Default for `enrichSectorFull`. Industry-sector profile walk — the sector's own metadata plus knowledge base context. | `details`, `knowledgebase` |
 
-Every full-walk preset stays inside its endpoint's allowed `include` set (see [Allowed `include` values per endpoint](#allowed-include-values-per-endpoint)) and deliberately leaves out `web_scrape` (a live external fetch, slow and rate-limited upstream) and `summary` (LLM generation). `CVE_NARRATIVE` is the one preset that opts into `summary` — that's what it's for.
+Every full-walk preset stays inside its endpoint's allowed `include` set (see [Allowed `include` values per endpoint](#allowed-include-values-per-endpoint)) and deliberately leaves out `summary` (LLM generation). `CVE_NARRATIVE` is the one preset that opts into `summary` — that's what it's for.
+
+Presets omit `osv_restricted` and optional layers such as `criteria`, `metasploit`, `nuclei`, `vendor_advisories` and `distro_advisories`. `cisa_kev` is in the CVE and product presets, but not `PACKAGE_FULL`. An explicit `include` replaces the preset.
 
 Three ways to use them:
 
@@ -532,14 +577,28 @@ const matrix = await ws.compareEnrichments([oldEnrichmentId, newEnrichmentId]);
 console.log(matrix.counts); // { new: 3, resolved: 1, changed: 2, persistent: 14 }
 ```
 
-Full surface: `discovery`, `listArtifacts`, `uploadArtifacts`, `getArtifact`,
+Full surface: `discovery`, `listArtifacts` (filters incl. `tlp`), `uploadArtifacts` (batch `tlp`), `getArtifact`,
 `getArtifactRaw` (buffers the raw body as a string, without a JSON re-wrap, up to 10,000,000 bytes),
-`updateArtifact` (rename / star / move), `deleteArtifact`, `copyArtifact`, the bulk helpers
+`updateArtifact` (rename / star / move / set `tlp` — a `tlp`-only PATCH is valid), `deleteArtifact`, `copyArtifact`, the bulk helpers
 (`bulkDelete`, `moveToFolder`, `bulkSetFavorite`, `downloadBundle`), `getRating` / `setRating`,
 `listExports` / `getExport` / `downloadAllExports`, `compareEnrichments`, `saveEnrichment`, and folder CRUD
 (`listFolders`, `createFolder`, `renameFolder`, `deleteFolder`, `downloadFolder`). The Artifact Manager surface lives outside
 the versioned `/v1` OpenAPI contract and evolves independently. Non-2xx throws the
 same `UnexpectedStatus`.
+
+Every artifact the library returns carries its own `tlp: Tlp` — the per-artifact TLP 2.0 marking
+(`CLEAR`, `GREEN`, `AMBER`, `AMBER+STRICT`, `RED`); legacy rows read `AMBER`. `listArtifacts({ tlp })`
+filters by it, `uploadArtifacts(…, { tlp })` sets it batch-wide (default `AMBER`), and
+`updateArtifact(id, { tlp })` changes it at any time. `getArtifactRaw` also returns it from the
+`X-Artifact-Tlp` header. An invalid value throws a `RangeError` before any request.
+
+`getExport`, `downloadAllExports`, `downloadBundle`, and `downloadFolder` take an optional
+`{ tlp }` — the TLP 2.0 marking stamped into every export format that has a slot for one
+(`CLEAR`, `GREEN`, `AMBER`, `AMBER+STRICT`, `RED`), overriding the artifact's stored marking. Omit it
+and each export is stamped with the **artifact's own stored `tlp`** (the bundle/folder zips use each
+artifact's own). OpenVEX, CSV, and the DISA
+eMASS worksheet carry no marking slot and ignore it. An invalid value throws a `RangeError` before
+any request.
 
 ### Inventory Manager (`client.inventoryManager`)
 
@@ -558,7 +617,7 @@ for (const a of briefing.recommended_actions as Array<Record<string, unknown>>) 
 // briefing.report is the full /v1/inventory-enrich result (per-asset findings + rollup)
 ```
 
-`format` is one of `json` / `sbom` / `csv` / `nmap` / `list` / `grype` / `trivy` / `depcheck` / `nessus` / `gvm` / `xlsx`
+`format` is one of `json` / `sbom` / `csv` / `nmap` / `list` / `grype` / `trivy` / `depcheck` / `nessus` / `gvm` / `xlsx` / `vex`
 (you pick it; there is no auto-detection). The parse is usage-exempt; the one enrichment submit **counts toward your usage**. Need
 just the parsed assets? `client.inventoryManager.parseScan(content, format)` returns `{format, items, count}`
 without enriching. (Same workflow the `ccc ingest` CLI wraps.)
@@ -576,9 +635,17 @@ submit rather than analyze incomplete attachment evidence.
 Beyond ingest, `client.inventoryManager` covers the full inventory surface — CRUD, `enrichInventory`,
 `saveEnrichment` (file a finished enrichment into the inventory's history), `listEnrichments`,
 **`compareEnrichments`** (a CVE-matched difference matrix across 2–12 of an inventory's saved enrichments),
+**`getHistory`** / **`iterHistory`** (the inventory's change history — every edit, attach, TLP change, setting, saved enrichment and report, newest first; filter by `types`, `q`, `since`/`until`, `actor`; `getHistory` returns one page with `next_cursor`, `iterHistory` is an async iterator that follows it),
 `importInventory` / `exportInventory`, multi-source import (`parseMulti` / `importMulti`), the safe asset
-editors (`replaceAssets` / `addAssets` / `applyAssetFix`), `setFavorite`, attachments, and daily automation
+editors (`replaceAssets` / `addAssets` / `applyAssetFix` — the fix rewrites every asset carrying the
+product, or just one host's when you pass `group`), `setFavorite`, attachments, and daily automation
 (`getAutomation` / `setAutomation`).
+
+`exportInventory` takes an optional `{ tlp }` — the TLP 2.0 marking stamped into every asset-inventory
+format that has a slot for one (`cyclonedx`, `spdx`, `spdx2`, `workbook`; `CLEAR`, `GREEN`, `AMBER`,
+`AMBER+STRICT`, `RED`), overriding the inventory's stored marking. Omit it to stamp the inventory's own
+stored `tlp`. `json`, `csv`, and `list` have no marking slot and ignore it. An
+invalid value throws a `RangeError` before any request.
 
 ### Report Generator (`client.aiReports`)
 
@@ -602,15 +669,34 @@ Full surface: `discovery`, `listTemplates`, `listReports`, `getReport`, `getRepo
 the raw HTML string up to 10,000,000 bytes; it does not return a stream. Responses are plain objects;
 non-2xx throws the same `UnexpectedStatus`.
 
+`exportReport` also takes an optional `{ tlp }` (same five values) stamped into the
+exported document, overriding the report's stored marking; omit it to stamp the report's own stored
+`tlp`. An invalid value throws a `RangeError` before any request.
+
+`createDraft` and `generateReport` take an optional `{ tlp }` too: the marking stored on the new report,
+as given. Omit it and the report starts from your default report TLP (the Report Generator's Settings,
+`AMBER` until you set one), raised to the most restrictive marking among its sources. The draft
+response carries the stored `tlp`.
+
 ### Enricher (`client.enricher`)
 
 `client.enricher.enrich` is a thin submit→poll convenience over the async `/v1/artifact-enrich` engine —
 it stages a security artifact (pasted text + uploaded files), submits, polls until done, and resolves to
-the completed report (`{ enrichment_id, report }`). The **submit counts toward your usage**; the poll is
-exempt. Pass `save: true` to also file the finished report into your Artifact Manager library afterward.
+the completed report (`{ enrichment_id, report }`). `client.enricher.enrichEvent` is the sibling
+convenience over the async `/v1/event-enrich` engine: it submits a raw security event (`event` — a
+Defender XDR / Sentinel alert, a SIEM/EDR log line, any JSON or text; ≤200,000 chars — plus an optional
+`eventId` ≤200 chars), polls until done, and resolves to `{ enrichment_id, result }`, where `result` is
+the `EventEnrichmentResult` (per-indicator findings + graded aggregate threat assessment). The **submit
+counts toward your usage**; the poll is exempt. For `enrich`, pass `save: true` to also file the
+finished report into your Artifact Manager library afterward.
 `timeoutMs` is a hard end-to-end polling deadline: status requests, response reads, `onProgress`
 callbacks, and sleeps all share the same remaining budget. `pollIntervalMs` and `timeoutMs` must be
 finite and non-negative.
+
+`enrich` also accepts `tlp` in its options — the TLP 2.0 marking stamped into each exported format
+that carries one (`CLEAR`, `GREEN`, `AMBER`, `AMBER+STRICT`, `RED`; default `AMBER`). OpenVEX, CSV,
+and the DISA eMASS worksheet have no slot and ignore it; an invalid value throws a `RangeError` before
+the (billable) submit.
 
 ```ts
 const result = await client.enricher.enrich({
@@ -618,15 +704,21 @@ const result = await client.enricher.enrich({
   save: true,
 });
 console.log(result.enrichment_id);
+
+const event = await client.enricher.enrichEvent({
+  event: '{"AlertName": "…", "Severity": "High", "IOC": {"Type": "IP", "Value": "1.2.3.4"}}',
+  eventId: "INC-2026-0091",
+});
+console.log((event.result as { threat_assessment: { verdict: string } }).threat_assessment.verdict);
 ```
 
 ## Depth control (`include`)
 
-The 15 single-entity enrichment endpoints, `searchCve`, and all four assessment endpoints accept an `include: readonly string[]` parameter that controls how deep the walk goes. `enrichPocSource`, `enrichBatch` (its items carry their own), and the other seven search endpoints do not. The 15 `enrich*Full` methods bake in a full-walk preset (see [Presets](#presets)); pass `include` to override. `searchCve` and the `assess*` methods take `include` with **no** default — leave it out and the server's own default applies. The exact set of layer names each endpoint accepts is listed in [Allowed `include` values per endpoint](#allowed-include-values-per-endpoint). Invalid values return HTTP 422 with the allowed list in `error.detail`.
+The 17 single-entity enrichment endpoints, `searchCve`, `searchKev`, `searchMisp`, `searchCti`, `searchD3fend`, and all four assessment endpoints accept an `include: readonly string[]` parameter that controls how deep the walk goes. `enrichPocSource`, `enrichBatch` (its items carry their own), and the other four search endpoints (`knowledgebase`, `poc`, `vendor`, `csaf`) do not — send `include` there and it is ignored as an unknown field (named in the `X-Ignored-Fields` response header), not rejected. The 17 `enrich*Full` methods bake in a full-walk preset (see [Presets](#presets)); pass `include` to override. `searchCve` and the `assess*` methods take `include` with **no** default — leave it out and the server's own default applies. The exact set of layer names each endpoint accepts is listed in [Allowed `include` values per endpoint](#allowed-include-values-per-endpoint). Invalid values return HTTP 422 with the allowed list in `error.detail`.
 
 ## Beyond the convenience surface
 
-There is no gap to cover: **every one of the 33 `/v1` operations has a named method** on `CrawlerClient`. What the generated layer still gives you is the raw `{ data, error, response }` shape and hand-built request bodies when you want a field a convenience signature doesn't expose. Pass `client.api` to the endpoint function:
+There is no gap to cover: **every one of the 38 `/v1` operations has a named method** on `CrawlerClient`. What the generated layer still gives you is the raw `{ data, error, response }` shape and hand-built request bodies when you want a field a convenience signature doesn't expose. Pass `client.api` to the endpoint function:
 
 ```ts
 import { CrawlerClient } from "@crimson-crawler/crimson-crawler-client";
@@ -645,7 +737,7 @@ const { data, error } = await searchCve({
 
 ### Endpoint catalog
 
-#### Enrichment (17 endpoints)
+#### Enrichment (19 endpoints)
 
 | Function | Imported from | What it returns |
 |---|---|---|
@@ -653,32 +745,35 @@ const { data, error } = await searchCve({
 | `enrichIoc` | `_generated/sdk.gen` | IOC → MISP events, linked techniques, threat assessment |
 | `enrichCwe` | `_generated/sdk.gen` | CWE → CAPEC patterns, ATT&CK techniques, TIE predictions |
 | `enrichCapec` | `_generated/sdk.gen` | CAPEC → linked techniques and weaknesses |
+| `enrichAtlas` | `_generated/sdk.gen` | Adversarial ML technique enrichment |
 | `enrichTechnique` | `_generated/sdk.gen` | ATT&CK technique → groups, software, campaigns, Navigator JSON |
 | `enrichProduct` | `_generated/sdk.gen` | Product/version → affected CVEs, KEV, exploit signals |
 | `enrichPackage` | `_generated/sdk.gen` | Package/ecosystem (OSV.dev) → advisories + per-CVE enrichment |
 | `enrichGroup` | `_generated/sdk.gen` | Threat actor → techniques, software, campaigns |
 | `enrichSoftware` | `_generated/sdk.gen` | Malware/tool → techniques, attribution |
 | `enrichCampaign` | `_generated/sdk.gen` | Campaign → groups, techniques, timeline |
-| `enrichAtlas` | `_generated/sdk.gen` | Adversarial ML technique enrichment |
-| `enrichDisarm` | `_generated/sdk.gen` | Disinformation countermeasures |
+| `enrichDisarm` | `_generated/sdk.gen` | Disinformation technique enrichment, incl. its DISARM family |
 | `enrichDefend` | `_generated/sdk.gen` | D3FEND defensive technique enrichment |
+| `enrichF3` | `_generated/sdk.gen` | MITRE F3 fraud technique → the ATT&CK Enterprise techniques it borrows |
+| `enrichCloak` | `_generated/sdk.gen` | CLOAK concealment technique → knowledge base context |
 | `enrichLocation` | `_generated/sdk.gen` | Regional threat picture |
 | `enrichSector` | `_generated/sdk.gen` | Industry threat picture |
 | `enrichPocSource` | `_generated/sdk.gen` | LLM-summarized analysis of PoC repositories |
 | `enrichBatch` | `_generated/sdk.gen` | Up to 50 mixed enrich items, each with its own `include` |
 
-#### Search (8 endpoints)
+#### Search (9 endpoints)
 
 | Function | Imported from | What it does |
 |---|---|---|
 | `searchCve` | `_generated/sdk.gen` | Filter CVEs by CWE, CPE, CVSS, EPSS, KEV, dates |
+| `searchMisp` | `_generated/sdk.gen` | Events from [our curated MISP](https://crimsoncrawler.com/docs/guides/data-sources/#our-curated-misp) by indicator or event info |
 | `searchCti` | `_generated/sdk.gen` | Cross-knowledge-base search (ATT&CK, CWE, CAPEC, ATLAS, DISARM) |
 | `searchKev` | `_generated/sdk.gen` | Known Exploited Vulnerabilities catalog |
-| `searchMisp` | `_generated/sdk.gen` | Threat intel events by indicator or event info |
 | `searchKnowledgebase` | `_generated/sdk.gen` | Natural-language semantic search over ingested OSINT |
 | `searchVendor` | `_generated/sdk.gen` | Vendor product lookup with CPE identifiers |
 | `searchPoc` | `_generated/sdk.gen` | Proof-of-concept exploit search for a CVE |
 | `searchD3Fend` | `_generated/sdk.gen` | D3FEND defensive technique search |
+| `searchCsaf` | `_generated/sdk.gen` | CSAF vendor-advisory search (CVE, advisory id, publisher, sector, product, CPE, TLP), including CVE-less advisories |
 
 #### Assessment (4 endpoints)
 
@@ -689,7 +784,7 @@ const { data, error } = await searchCve({
 | `assessGroupExposure` | `_generated/sdk.gen` | Combined threat surface for threat-actor groups |
 | `assessIocPortfolio` | `_generated/sdk.gen` | Multi-indicator threat analysis |
 
-#### Async engines (4 endpoints)
+#### Async engines (6 endpoints)
 
 | Function | Imported from | What it does |
 |---|---|---|
@@ -697,46 +792,55 @@ const { data, error } = await searchCve({
 | `artifactEnrichStatus` | `_generated/sdk.gen` | Per-stage progress, then the finished report (usage-exempt) |
 | `inventoryEnrich` | `_generated/sdk.gen` | Submit an asset inventory for background enrichment → `202` + `enrichment_id` |
 | `inventoryEnrichStatus` | `_generated/sdk.gen` | Per-stage progress, then the finished findings (usage-exempt) |
+| `eventEnrich` | `_generated/sdk.gen` | Submit a raw security event for background enrichment → `202` + `enrichment_id` |
+| `eventEnrichStatus` | `_generated/sdk.gen` | Per-stage progress, then the finished `EventEnrichmentResult` (usage-exempt) |
 
 ### Allowed `include` values per endpoint
 
-Each endpoint accepts its own set of `include` layer names. Pass any subset. Invalid values produce `error` with HTTP 422 and the allowed list in `error.detail`.
+Each endpoint accepts its own set of `include` layer names. Pass any subset. Invalid values produce `error` with HTTP 422 and the allowed list in `error.detail` — but only on endpoints that declare `include`: send it to one that does not and it is ignored as an unknown field (named in the `X-Ignored-Fields` response header), not rejected.
 
 **Enrichment**
 
 | Endpoint | Allowed `include` values |
 |---|---|
-| `enrichCve` | `affected_products`, `campaigns`, `capec`, `cwe`, `defend`, `details`, `detections`, `epss`, `exploits`, `groups`, `inferred_chain`, `kev`, `knowledgebase`, `misp`, `mitigations`, `navigator`, `nist_controls`, `osv`, `poc`, `poc_source`, `sector_context`, `similar_cves`, `software`, `ssvc`, `summary`, `techniques`, `tie`, `timeline`, `web`, `web_scrape` |
-| `enrichProduct` | `affected_products`, `campaigns`, `capec`, `cwe`, `defend`, `details`, `detections`, `epss`, `exploits`, `groups`, `kev`, `knowledgebase`, `misp`, `mitigations`, `navigator`, `nist_controls`, `osv`, `poc`, `risk_summary`, `software`, `ssvc`, `summary`, `techniques`, `tie`, `web`, `web_scrape` |
-| `enrichPackage` | `affected`, `affected_products`, `campaigns`, `capec`, `cwe`, `defend`, `details`, `detections`, `epss`, `exploits`, `groups`, `inferred_chain`, `kev`, `knowledgebase`, `misp`, `mitigations`, `navigator`, `nist_controls`, `osv`, `poc`, `poc_source`, `references`, `sector_context`, `severity`, `similar_cves`, `software`, `ssvc`, `summary`, `techniques`, `tie`, `timeline`, `web`, `web_scrape` |
-| `enrichCwe` | `campaigns`, `capecs`, `cves`, `defend`, `details`, `detections`, `groups`, `knowledgebase`, `mitigations`, `navigator`, `nist_controls`, `software`, `summary`, `techniques`, `tie`, `web`, `web_scrape` |
-| `enrichCapec` / `enrichAtlas` | `campaigns`, `cves`, `defend`, `details`, `detections`, `groups`, `knowledgebase`, `mitigations`, `navigator`, `nist_controls`, `software`, `summary`, `techniques`, `tie`, `web`, `web_scrape` |
-| `enrichTechnique` | `campaigns`, `cves`, `defend`, `details`, `detections`, `groups`, `knowledgebase`, `misp`, `mitigations`, `navigator`, `nist_controls`, `software`, `summary`, `tie`, `web`, `web_scrape` |
-| `enrichIoc` | `campaigns`, `cves`, `defend`, `detections`, `galaxies`, `groups`, `inferred_chain`, `knowledgebase`, `misp_attributes`, `mitigations`, `navigator`, `nist_controls`, `poc`, `sightings`, `software`, `summary`, `techniques`, `tie`, `warninglist`, `web`, `web_scrape` |
-| `enrichGroup` | `campaigns`, `cves`, `defend`, `details`, `detections`, `knowledgebase`, `locations`, `misp`, `mitigations`, `navigator`, `nist_controls`, `sectors`, `software`, `summary`, `techniques`, `tie`, `web`, `web_scrape` |
-| `enrichSoftware` | `campaigns`, `cves`, `defend`, `details`, `detections`, `groups`, `knowledgebase`, `misp`, `mitigations`, `navigator`, `nist_controls`, `summary`, `techniques`, `tie`, `web`, `web_scrape` |
-| `enrichCampaign` | `cves`, `defend`, `details`, `detections`, `groups`, `knowledgebase`, `mitigations`, `navigator`, `nist_controls`, `software`, `summary`, `techniques`, `tie`, `web`, `web_scrape` |
-| `enrichDisarm` | `campaigns`, `countermeasures`, `defend`, `details`, `detections`, `groups`, `knowledgebase`, `mitigations`, `navigator`, `software`, `summary`, `techniques`, `tie`, `web`, `web_scrape` |
-| `enrichLocation` | `campaigns`, `cves`, `defend`, `details`, `detections`, `groups`, `knowledgebase`, `mitigations`, `navigator`, `sectors`, `software`, `summary`, `techniques`, `tie`, `web`, `web_scrape` |
-| `enrichSector` | `campaigns`, `cves`, `defend`, `details`, `detections`, `groups`, `knowledgebase`, `locations`, `mitigations`, `navigator`, `software`, `summary`, `techniques`, `tie`, `web`, `web_scrape` |
-| `enrichDefend` | `details`, `knowledgebase`, `summary`, `techniques`, `web`, `web_scrape` |
+| `enrichCve` | `affected_chipsets`, `affected_products`, `android_bulletin`, `campaigns`, `capec`, `capec_full`, `cellular`, `cellular_core`, `certfr_advisories`, `certfr_advisories_full`, `cisa_campaigns`, `cisa_kev`, `criteria`, `csaf_advisories`, `csaf_advisories_full`, `cvss_bt`, `cwe`, `defend`, `defend_full`, `details`, `detections`, `distro_advisories`, `emb3d`, `epss`, `euvd`, `exploits`, `groups`, `inferred_chain`, `jvn`, `kev`, `knowledgebase`, `log_sources`, `log_sources_full`, `metasploit`, `misp`, `mitigations`, `navigator`, `nist_controls`, `nuclei`, `osv`, `osv_restricted`, `ot_context`, `ot_vendor_advisories`, `poc`, `poc_full`, `poc_source`, `sigma`, `sigma_full`, `similar_cves`, `software`, `ssvc`, `summary`, `techniques`, `tie`, `timeline`, `vendor_advisories`, `versions`, `vince`, `vulnrichment`, `weakness_ranks` |
+| `enrichProduct` | `affected_products`, `android_bulletin`, `campaigns`, `capec`, `capec_full`, `cellular`, `cellular_core`, `certfr_advisories`, `certfr_advisories_full`, `cisa_campaigns`, `cisa_kev`, `csaf_advisories`, `csaf_advisories_full`, `cvss_bt`, `cwe`, `defend`, `details`, `detections`, `emb3d`, `epss`, `exploits`, `groups`, `jvn`, `kev`, `knowledgebase`, `lifecycle`, `log_sources`, `metasploit`, `misp`, `mitigations`, `navigator`, `nist_controls`, `nuclei`, `osv`, `osv_restricted`, `ot_context`, `ot_vendor_advisories`, `poc`, `risk_summary`, `sigma`, `software`, `ssvc`, `summary`, `techniques`, `tie`, `vulnrichment`, `weakness_ranks` |
+| `enrichPackage` | `affected`, `affected_chipsets`, `affected_products`, `campaigns`, `capec`, `capec_full`, `cellular_core`, `certfr_advisories`, `certfr_advisories_full`, `cisa_campaigns`, `cisa_kev`, `criteria`, `csaf_advisories`, `csaf_advisories_full`, `cvss_bt`, `cwe`, `defend`, `defend_full`, `details`, `detections`, `emb3d`, `epss`, `exploits`, `groups`, `inferred_chain`, `jvn`, `kev`, `knowledgebase`, `log_sources`, `log_sources_full`, `metasploit`, `misp`, `mitigations`, `navigator`, `nist_controls`, `nuclei`, `osv`, `osv_restricted`, `ot_context`, `ot_vendor_advisories`, `poc`, `poc_full`, `poc_source`, `references`, `severity`, `sigma`, `sigma_full`, `similar_cves`, `software`, `ssvc`, `summary`, `techniques`, `tie`, `timeline`, `vendor_advisories`, `versions`, `vulnrichment`, `weakness_ranks` |
+| `enrichCwe` | `campaigns`, `capecs`, `cves`, `defend`, `defend_full`, `details`, `detections`, `groups`, `knowledgebase`, `log_sources`, `log_sources_full`, `mitigations`, `navigator`, `nist_controls`, `software`, `summary`, `techniques`, `tie`, `versions` |
+| `enrichCapec` | `campaigns`, `cves`, `defend`, `defend_full`, `details`, `detections`, `groups`, `knowledgebase`, `log_sources`, `log_sources_full`, `mitigations`, `navigator`, `nist_controls`, `software`, `summary`, `techniques`, `tie`, `versions` |
+| `enrichAtlas` | `details`, `knowledgebase`, `mitigations`, `summary`, `techniques`, `versions` |
+| `enrichTechnique` | `analytic_details`, `asset_classes`, `atomic_red_team`, `campaigns`, `cisa_campaigns`, `cves`, `defend`, `defend_full`, `details`, `detections`, `fight`, `framework_mappings`, `fraud`, `groups`, `knowledgebase`, `log_sources`, `log_sources_full`, `lolbas`, `lotl`, `misp`, `mitigations`, `navigator`, `nist_controls`, `sigma`, `sigma_full`, `software`, `summary`, `tie`, `versions` |
+| `enrichIoc` | `analytic_details`, `campaigns`, `cisa_campaigns`, `cves`, `defend`, `defend_full`, `detections`, `domain_context`, `galaxies`, `galaxy_clusters_full`, `groups`, `hashlookup`, `inferred_chain`, `knowledgebase`, `listed_on`, `log_sources`, `log_sources_full`, `misp_attributes`, `mitigations`, `navigator`, `network_context`, `nist_controls`, `poc`, `poc_full`, `sightings`, `software`, `summary`, `techniques`, `tie`, `warninglist` |
+| `enrichGroup` | `campaigns`, `cves`, `defend`, `defend_full`, `details`, `detections`, `knowledgebase`, `log_sources`, `log_sources_full`, `misp`, `mitigations`, `navigator`, `nist_controls`, `software`, `summary`, `techniques`, `tie`, `versions` |
+| `enrichSoftware` | `campaigns`, `cves`, `defend`, `defend_full`, `details`, `detections`, `groups`, `knowledgebase`, `log_sources`, `log_sources_full`, `misp`, `mitigations`, `navigator`, `nist_controls`, `summary`, `techniques`, `tie`, `versions` |
+| `enrichCampaign` | `cves`, `defend`, `defend_full`, `details`, `detections`, `groups`, `knowledgebase`, `log_sources`, `log_sources_full`, `mitigations`, `navigator`, `nist_controls`, `software`, `summary`, `techniques`, `tie`, `versions` |
+| `enrichDisarm` | `details`, `knowledgebase`, `summary`, `techniques`, `versions` |
+| `enrichLocation` | `details`, `knowledgebase`, `summary`, `versions` |
+| `enrichSector` | `details`, `knowledgebase`, `summary`, `versions` |
+| `enrichDefend` | `details`, `knowledgebase`, `summary`, `techniques`, `versions` |
+| `enrichF3` | `details`, `knowledgebase`, `summary`, `techniques`, `versions` |
+| `enrichCloak` | `details`, `knowledgebase`, `summary`, `versions` |
 | `enrichPocSource` | _no `include` parameter — pass `repo_url` only_ |
 
 **Search**
 
 | Endpoint | Allowed `include` values |
 |---|---|
-| `searchCve` | `details` |
+| `searchCve` | `cna`, `details`, `epss_reports`, `kb_rankings`, `kb_rankings_full`, `statistics` |
+| `searchKev` | `statistics` — the deployment-wide corpus coverage block, on by default; pass `include: []` to omit it. |
+| `searchMisp` | `event_reports`, `tags`, `version` default on; `feeds`, `misp_events_full`, `objects`, `sightings`, `stats` are opt-in. Pass `include: []` to omit the defaults. |
+| `searchCti` | `kb_versions` |
+| `searchD3fend` | `versions` — on by default; pass `include: []` to omit it. |
 | All other `search*` endpoints | _no `include` parameter — filter via the request body fields_ |
 
 **Assessment**
 
 | Endpoint | Allowed `include` values |
 |---|---|
-| `assessTechniqueCoverage` | `coverage_score`, `cves`, `defend`, `detections`, `mitigations`, `navigator`, `nist_controls`, `summary`, `tie` |
-| `assessVulnerabilityExposure` | `defend`, `exploit_chain`, `exploits`, `navigator`, `nist_controls`, `osv`, `prioritized_remediation`, `remediation_plan`, `ssvc`, `summary`, `techniques`, `tie` |
-| `assessGroupExposure` | `cves`, `defend`, `details`, `locations`, `navigator`, `nist_controls`, `sectors`, `summary`, `techniques`, `tie` |
-| `assessIocPortfolio` | `campaigns`, `defend`, `detections`, `galaxies`, `groups`, `misp_attributes`, `mitigations`, `nist_controls`, `sightings`, `software`, `summary`, `techniques`, `tie`, `warninglist` |
+| `assessTechniqueCoverage` | `coverage_score`, `cves`, `defend`, `defend_full`, `detections`, `log_sources`, `log_sources_full`, `mitigations`, `navigator`, `nist_controls`, `summary`, `tie`, `versions` |
+| `assessVulnerabilityExposure` | `defend`, `defend_full`, `exploit_chain`, `exploits`, `log_sources`, `log_sources_full`, `navigator`, `nist_controls`, `osv`, `osv_restricted`, `prioritized_remediation`, `remediation_plan`, `ssvc`, `summary`, `techniques`, `tie`, `versions` |
+| `assessGroupExposure` | `cves`, `defend`, `defend_full`, `details`, `log_sources`, `log_sources_full`, `navigator`, `nist_controls`, `summary`, `techniques`, `tie`, `versions` |
+| `assessIocPortfolio` | `campaigns`, `defend`, `defend_full`, `detections`, `galaxies`, `groups`, `log_sources`, `log_sources_full`, `misp_attributes`, `misp_attributes_full`, `misp_events_full`, `mitigations`, `nist_controls`, `sightings`, `software`, `summary`, `techniques`, `tie`, `versions`, `warninglist` |
 
 ### Calling pattern
 
@@ -817,7 +921,7 @@ Every layer of an enrichment response is independently optional. If a layer wasn
 
 ```ts
 // Defensive scalar access
-const cvss = result.cve?.cvss_score;
+const cvss = result.cve?.cvss_v3_score;
 
 // Defensive list iteration
 for (const t of result.techniques ?? []) { /* ... */ }
@@ -892,7 +996,7 @@ Node 22+ is the supported runtime. Requests use the built-in `fetch` by default.
 |---|---|---|
 | `CrawlerClient` | class | Main client class |
 | `CrawlerClientOptions` | interface | Constructor options |
-| `presets` | namespace | 18 named `include` lists |
+| `presets` | namespace | 20 named `include` lists |
 | `CrawlerClientError` | class | Base for everything this package raises |
 | `MissingCredentials` | class | Constructor missing API key |
 | `UnexpectedStatus` | class | Non-success or unparseable response |

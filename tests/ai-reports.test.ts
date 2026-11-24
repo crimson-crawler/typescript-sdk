@@ -143,6 +143,22 @@ describe("create + fill", () => {
     });
   });
 
+  it("createDraft sends tlp, and rejects an invalid one before any request", async () => {
+    mockFetch.mockResolvedValue(
+      jsonResp(201, { id: "r3", ai_sections: [], skipped: [], tlp: "RED" }),
+    );
+    await ws.createDraft("exec", { tlp: "RED" });
+    expect(JSON.parse(String(lastCall().init.body))).toEqual({
+      template: "exec",
+      tlp: "RED",
+    });
+    mockFetch.mockClear();
+    await expect(
+      ws.createDraft("exec", { tlp: "WHITE" as never }),
+    ).rejects.toThrow(RangeError);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it("fillSection (next pending) posts an empty body", async () => {
     mockFetch.mockResolvedValue(
       jsonResp(200, { section_type: "bluf", complete: true }),
@@ -223,6 +239,23 @@ describe("export", () => {
     expect(out.filename).toBe("r1.html");
     expect(lastCall().url.pathname).toBe("/ai-reports/reports/r1/export/html");
   });
+
+  it("exportReport sends tlp, encoded, and omits it when unset", async () => {
+    mockFetch.mockResolvedValue(rawResp("# R", {}));
+    await ws.exportReport("r1", "md", { tlp: "AMBER+STRICT" });
+    expect(lastCall().url.search).toContain("tlp=AMBER%2BSTRICT");
+
+    mockFetch.mockResolvedValue(rawResp("# R", {}));
+    await ws.exportReport("r1", "md");
+    expect(lastCall().url.search).toBe("");
+  });
+
+  it("exportReport rejects an invalid tlp with RangeError before any request", async () => {
+    await expect(
+      ws.exportReport("r1", "md", { tlp: "TLP:RED" as never }),
+    ).rejects.toThrow(RangeError);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
 });
 
 describe("generateReport", () => {
@@ -268,6 +301,20 @@ describe("generateReport", () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
+  it("generateReport passes tlp to the draft", async () => {
+    mockFetch
+      .mockResolvedValueOnce(
+        jsonResp(201, { id: "r1", ai_sections: [], skipped: [], tlp: "GREEN" }),
+      )
+      .mockResolvedValueOnce(jsonResp(200, { report: { id: "r1" } }));
+    await ws.generateReport("exec", { tlp: "GREEN" });
+    const first = mockFetch.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(first[1].body))).toEqual({
+      template: "exec",
+      tlp: "GREEN",
+    });
+  });
+
   it("records a copilot 502 and stops", async () => {
     mockFetch
       .mockResolvedValueOnce(
@@ -281,6 +328,81 @@ describe("generateReport", () => {
       .mockResolvedValueOnce(jsonResp(200, { report: { id: "r1" } }));
     const out = await ws.generateReport("exec");
     expect(out.sections).toEqual([{ error: "generation failed", status: 502 }]);
+  });
+
+  // A gateway rate limit must stop the loop like a 502 — never throw out of generateReport, which
+  // would destroy the partial-report contract the JSDoc promises.
+  it("records a rate-limit 429 and stops, keeping the sections that filled", async () => {
+    mockFetch
+      .mockResolvedValueOnce(
+        jsonResp(201, {
+          id: "r1",
+          ai_sections: [{ section_type: "a" }, { section_type: "b" }],
+          skipped: [],
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResp(200, {
+          section_type: "a",
+          filled: true,
+          remaining: ["b"],
+          complete: false,
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResp(429, { message: "API rate limit exceeded" }),
+      )
+      .mockResolvedValueOnce(jsonResp(200, { report: { id: "r1" } }));
+    const out = await ws.generateReport("exec");
+    const sections = out.sections as Record<string, unknown>[];
+    expect(sections[0].section_type).toBe("a");
+    expect(sections[1]).toEqual({ error: "rate limited", status: 429 });
+    expect((out.report as Record<string, unknown>).id).toBe("r1");
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+  });
+
+  it("records the built-in AI's daily-allowance 429 as quota exhausted, not a rate limit", async () => {
+    mockFetch
+      .mockResolvedValueOnce(
+        jsonResp(201, {
+          id: "r1",
+          ai_sections: [{ section_type: "a" }],
+          skipped: [],
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResp(429, {
+          error: "report_inference_quota_exceeded",
+          detail: "used up",
+        }),
+      )
+      .mockResolvedValueOnce(jsonResp(200, { report: { id: "r1" } }));
+    const out = await ws.generateReport("exec");
+    expect(out.sections).toEqual([{ error: "quota exhausted", status: 429 }]);
+  });
+
+  // Bring-your-own-key: with no AI provider saved the first fill is a 402. The deterministic draft
+  // already exists, so it comes back with the stop recorded instead of a thrown error.
+  it("records a no-AI-provider 402 and still returns the draft", async () => {
+    mockFetch
+      .mockResolvedValueOnce(
+        jsonResp(201, {
+          id: "r1",
+          ai_sections: [{ section_type: "a" }, { section_type: "b" }],
+          skipped: [],
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResp(402, {
+          error: "AI features use your own AI provider.",
+          code: "llm_not_configured",
+        }),
+      )
+      .mockResolvedValueOnce(jsonResp(200, { report: { id: "r1" } }));
+    const out = await ws.generateReport("exec");
+    expect(out.sections).toEqual([{ error: "no AI provider", status: 402 }]);
+    expect((out.report as Record<string, unknown>).id).toBe("r1");
+    expect(mockFetch).toHaveBeenCalledTimes(3);
   });
 });
 

@@ -104,6 +104,7 @@ describe("artifacts", () => {
           "x-artifact-kind": "artifact_enrichment",
           "x-artifact-name": "Scan%20%C2%B7%205",
           "x-artifact-format": "scan_report",
+          "x-artifact-tlp": "RED",
         },
       }),
     );
@@ -111,6 +112,7 @@ describe("artifacts", () => {
     expect(raw.content).toBe('{"report":1}');
     expect(raw.kind).toBe("artifact_enrichment");
     expect(raw.name).toBe("Scan · 5"); // URL-decoded
+    expect(raw.tlp).toBe("RED");
     expect(lastCall().url.searchParams.get("raw")).toBe("1");
   });
 
@@ -358,6 +360,99 @@ describe("folders", () => {
   });
 });
 
+describe("tlp marking", () => {
+  const ZIP = () =>
+    new Response(new Uint8Array([0x50, 0x4b]), {
+      status: 200,
+      headers: { "content-type": "application/zip" },
+    });
+
+  it("getExport sends every accepted value as a query param", async () => {
+    for (const tlp of [
+      "CLEAR",
+      "GREEN",
+      "AMBER",
+      "AMBER+STRICT",
+      "RED",
+    ] as const) {
+      mockFetch.mockResolvedValueOnce(
+        new Response("{}", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+      await ws.getExport("s1", "stix", { tlp });
+      expect(lastCall().url.searchParams.get("tlp")).toBe(tlp);
+    }
+  });
+
+  it("getExport encodes `+` so AMBER+STRICT is distinguishable from a space", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResp(200, {}));
+    await ws.getExport("s1", "stix", { tlp: "AMBER+STRICT" });
+    expect(lastCall().url.search).toContain("tlp=AMBER%2BSTRICT");
+  });
+
+  it("getExport omits the param when tlp is unset", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResp(200, {}));
+    await ws.getExport("s1", "stix");
+    expect(lastCall().url.search).toBe("");
+  });
+
+  it("getExport rejects an invalid value with RangeError before any request", async () => {
+    await expect(
+      ws.getExport("s1", "stix", { tlp: "WHITE" as never }),
+    ).rejects.toThrow(RangeError);
+    await expect(
+      ws.getExport("s1", "stix", { tlp: "amber" as never }),
+    ).rejects.toThrow(RangeError);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("bulk downloads forward tlp as a query param", async () => {
+    mockFetch.mockResolvedValue(ZIP());
+    await ws.downloadAllExports("s1", { tlp: "GREEN" });
+    expect(lastCall().url.searchParams.get("tlp")).toBe("GREEN");
+    mockFetch.mockResolvedValue(ZIP());
+    await ws.downloadFolder("f1", { tlp: "RED" });
+    expect(lastCall().url.searchParams.get("tlp")).toBe("RED");
+  });
+
+  it("downloadBundle forwards tlp in the JSON body, omitting it when unset", async () => {
+    mockFetch.mockResolvedValue(ZIP());
+    await ws.downloadBundle(["a1"], { tlp: "CLEAR" });
+    expect(JSON.parse(String(lastCall().init.body))).toEqual({
+      ids: ["a1"],
+      tlp: "CLEAR",
+    });
+    mockFetch.mockResolvedValue(ZIP());
+    await ws.downloadBundle(["a1"]);
+    expect(JSON.parse(String(lastCall().init.body))).toEqual({ ids: ["a1"] });
+  });
+
+  it("listArtifacts rejects an invalid tlp before any request", async () => {
+    await expect(ws.listArtifacts({ tlp: "WHITE" as never })).rejects.toThrow(
+      RangeError,
+    );
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("uploadArtifacts rejects an invalid tlp before any request", async () => {
+    await expect(
+      ws.uploadArtifacts([{ name: "n", content: "c", format: "paste" }], {
+        tlp: "amber" as never,
+      }),
+    ).rejects.toThrow(RangeError);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("updateArtifact rejects an invalid tlp before any request", async () => {
+    await expect(
+      ws.updateArtifact("a1", { tlp: "WHITE" as never }),
+    ).rejects.toThrow(RangeError);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+});
+
 describe("saveEnrichment", () => {
   const ID = "b".repeat(32);
 
@@ -392,5 +487,42 @@ describe("saveEnrichment", () => {
       jsonResp(409, { error: "enrichment not complete" }),
     );
     await expect(ws.saveEnrichment(ID)).rejects.toThrow(UnexpectedStatus);
+  });
+});
+
+describe("enricher settings", () => {
+  it("getEnricherSettings GETs /settings", async () => {
+    mockFetch.mockResolvedValue(
+      jsonResp(200, { artifact_tlp: "GREEN", inventory_tlp: "AMBER" }),
+    );
+    expect(await ws.getEnricherSettings()).toEqual({
+      artifact_tlp: "GREEN",
+      inventory_tlp: "AMBER",
+    });
+    const { url, init } = lastCall();
+    expect(url.pathname).toBe("/artifact-manager/settings");
+    expect(init.method).toBe("GET");
+  });
+
+  it("setEnricherSettings PUTs only the values it was given", async () => {
+    mockFetch.mockResolvedValue(
+      jsonResp(200, { artifact_tlp: "AMBER", inventory_tlp: "RED" }),
+    );
+    expect(await ws.setEnricherSettings({ inventoryTlp: "RED" })).toEqual({
+      artifact_tlp: "AMBER",
+      inventory_tlp: "RED",
+    });
+    const { url, init } = lastCall();
+    expect(url.pathname).toBe("/artifact-manager/settings");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string)).toEqual({ inventory_tlp: "RED" });
+  });
+
+  it("rejects an empty update and an invalid marking before any request", async () => {
+    await expect(ws.setEnricherSettings({})).rejects.toThrow(RangeError);
+    await expect(
+      ws.setEnricherSettings({ artifactTlp: "amber" as never }),
+    ).rejects.toThrow(/tlp must be one of/);
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 });

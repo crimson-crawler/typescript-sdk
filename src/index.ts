@@ -15,11 +15,13 @@ export {
   ENV_VERIFY_SSL,
   type CrawlerClientOptions,
 } from "./client";
+export { DEFAULT_MAX_RETRIES } from "./retry";
 export {
   CrawlerClientError,
   MissingCredentials,
   UnexpectedStatus,
 } from "./exceptions";
+export { TLP_INVALID_MESSAGE, TLP_VALUES, type Tlp, validateTlp } from "./tlp";
 export * as presets from "./presets";
 export {
   ArtifactManagerApi,

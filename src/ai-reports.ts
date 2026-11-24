@@ -9,13 +9,14 @@
  *
  * Same API key, same base URL, same retry/timeout fetch as every other call — **Report Generator calls
  * never count toward your API usage** (including the LLM generation). Reports are stored as
- * `kind=report` artifacts (`format='html_report'`); browser-authored ProseMirror reports export
- * PDF/DOCX/MD only from the editor, but API-generated HTML reports export as `html` or `md` here.
+ * `kind=report` artifacts. Every report, API-generated or built in the browser editor, exports as `html`
+ * or `md` here (charts come out as tables of their numbers); PDF/DOCX are exported from the editor.
  *
  * Exposed as `client.aiReports` (mirrors the Python `AiReportsAPI`).
  */
 
 import { UnexpectedStatus } from "./exceptions";
+import { type Tlp, validateTlp } from "./tlp";
 import { pathSegment } from "./url";
 
 /** A fetch-like function — the CrawlerClient hands in its retry/timeout wrapper. */
@@ -78,6 +79,46 @@ function downloadFilename(disposition: string, fallback: string): string {
     return fallback;
   }
   return basename;
+}
+
+/**
+ * Statuses that STOP the `generateReport` fill loop instead of throwing, mapped to what gets recorded
+ * for the section that could not run. A stop is not a failure of the whole call: the sections filled
+ * before it survive and the rest keep their unfilled cards.
+ *   502 — the model call failed (provider error or outage); retry it.
+ *   402 — no AI key is available (no own key, no platform fallback); add one under API Dashboard → AI Provider.
+ *   429 — the built-in AI's daily allowance (body `error: "report_inference_quota_exceeded"`, recorded as
+ *         `"quota exhausted"`; an own key has no limit) or the gateway rate limit (`"rate limited"`).
+ * A 409 is handled separately (nothing left to fill — not an error, and nothing to record).
+ */
+const STOP_STATUSES: Record<number, string> = {
+  502: "generation failed",
+  402: "no AI provider",
+  429: "rate limited",
+};
+
+const QUOTA_ERROR = "report_inference_quota_exceeded";
+
+/** The `error` field of a JSON error body (raw text as carried by `UnexpectedStatus`), else `undefined`. */
+function errorCode(body: unknown): unknown {
+  let parsed: unknown = body;
+  if (typeof body === "string") {
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      return undefined;
+    }
+  }
+  return parsed && typeof parsed === "object"
+    ? (parsed as { error?: unknown }).error
+    : undefined;
+}
+
+/** The note recorded for a status that stops the fill loop, or `undefined` to rethrow. */
+function stopNote(err: UnexpectedStatus): string | undefined {
+  if (err.status === 429 && errorCode(err.body) === QUOTA_ERROR)
+    return "quota exhausted";
+  return STOP_STATUSES[err.status];
 }
 
 /**
@@ -188,15 +229,22 @@ export class AiReportsApi {
    * Create a DRAFT report from a template + source artifacts. Renders the scaffold (static +
    * deterministic data sections) and returns the list of AI sections still to fill.
    *
-   * Resolves `{ id, name, html, ai_sections: [{section_type, label, ...}], skipped: [...] }`.
+   * `tlp` is an optional TLP 2.0 marking stored on the report exactly (`CLEAR` / `GREEN` / `AMBER` /
+   * `AMBER+STRICT` / `RED`). Omit it to use your default report TLP (the Report Generator's
+   * Settings), raised to the most restrictive source marking. An invalid value throws `RangeError`
+   * before any request.
+   *
+   * Resolves `{ id, name, html, ai_sections: [{section_type, label, ...}], skipped: [...], tlp }`.
    */
   async createDraft(
     template: string,
-    options: { sourceIds?: string[]; name?: string } = {},
+    options: { sourceIds?: string[]; name?: string; tlp?: Tlp } = {},
   ): Promise<Record<string, unknown>> {
+    const tlp = validateTlp(options.tlp);
     const body: Record<string, unknown> = { template };
     if (options.sourceIds !== undefined) body.source_ids = options.sourceIds;
     if (options.name !== undefined) body.name = options.name;
+    if (tlp !== undefined) body.tlp = tlp;
     return (await (
       await this.request("POST", "/ai-reports/reports", { json: body })
     ).json()) as Record<string, unknown>;
@@ -276,16 +324,23 @@ export class AiReportsApi {
   /**
    * Export a report as `html` or `md`. The body IS the export file.
    *
+   * `options.tlp` sets the TLP 2.0 marking written into the document (`CLEAR` / `GREEN` / `AMBER` /
+   * `AMBER+STRICT` / `RED`), overriding the report's stored TLP; omit it to stamp the report's own
+   * stored TLP. An invalid value throws a `RangeError` before any request.
+   *
    * Resolves `{ content, bytes, filename, contentType }`. `filename` is a sanitized basename from
-   * `Content-Disposition`. PDF/DOCX are browser-editor-only; browser-authored reports throw 422 here.
+   * `Content-Disposition`. PDF/DOCX are browser-editor-only. Reports built in the browser export here too.
    */
   async exportReport(
     reportId: string,
     fmt: "html" | "md" = "html",
+    options: { tlp?: Tlp } = {},
   ): Promise<Record<string, unknown>> {
+    const tlp = validateTlp(options.tlp);
     const resp = await this.request(
       "GET",
       `/ai-reports/reports/${pathSegment(reportId)}/export/${pathSegment(fmt)}`,
+      tlp === undefined ? {} : { params: { tlp } },
     );
     const disposition = resp.headers.get("content-disposition") ?? "";
     const filename = downloadFilename(disposition, `${reportId}.${fmt}`);
@@ -300,18 +355,27 @@ export class AiReportsApi {
 
   /**
    * Generate a report end-to-end: create the draft, fill every AI section, return the finished
-   * report. The convenience over `createDraft` + `fillSection`.
+   * report. The convenience over `createDraft` + `fillSection`; `options.tlp` is passed to
+   * `createDraft` (an exact marking; omit it for your default raised by the sources).
    *
-   * If a section's copilot call fails (502), generation stops there and returns what filled so far:
+   * Report sections run on the account's own AI provider (bring-your-own-key, saved in portal
+   * API Dashboard → AI Provider). If a section's model call fails (502), generation stops there and
+   * returns what filled so far:
    * the report keeps the sections completed before the failure, the failed section is recorded in
    * `sections` as `{ error: "generation failed", status: 502 }`, and that section plus any after it
    * stay unfilled cards. Re-run `generateReport` or fill the rest individually with `fillSection`.
+   *
+   * No AI key at all (402) stops the loop the same way, recorded as
+   * `{ error: "no AI provider", status: 402 }` — add a key, then fill the rest with `fillSection`. A
+   * spent daily allowance on the built-in AI (429) is recorded as `{ error: "quota exhausted", status: 429 }`
+   * (your own key has no limit), and a gateway rate limit as `{ error: "rate limited", status: 429 }`.
+   * Draft creation never calls a model.
    *
    * Resolves `{ report, sections: [<fill result per section>], skipped: [...] }`.
    */
   async generateReport(
     template: string,
-    options: { sourceIds?: string[]; name?: string } = {},
+    options: { sourceIds?: string[]; name?: string; tlp?: Tlp } = {},
   ): Promise<Record<string, unknown>> {
     const draft = await this.createDraft(template, options);
     const reportId = String(draft.id);
@@ -324,12 +388,13 @@ export class AiReportsApi {
       try {
         result = await this.fillSection(reportId);
       } catch (err) {
-        if (err instanceof UnexpectedStatus && err.status === 409) break; // nothing left to fill
-        if (err instanceof UnexpectedStatus && err.status === 502) {
-          sections.push({ error: "generation failed", status: 502 });
-          break;
-        }
-        throw err;
+        if (!(err instanceof UnexpectedStatus)) throw err;
+        if (err.status === 409) break; // nothing left to fill
+        const note = stopNote(err);
+        if (note === undefined) throw err;
+        // Record + stop; the section keeps its unfilled card and the earlier ones survive.
+        sections.push({ error: note, status: err.status });
+        break;
       }
       sections.push(result);
       if (result.complete) break;
